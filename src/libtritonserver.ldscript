@@ -29,5 +29,12 @@
     TRITONBACKEND_*;
     TRITONREPOAGENT_*;
     TRITONCACHE_*;
+    # Internal C++ symbols exported so the unit tests under src/test/ can
+    # link against the shared library (the tests exercise scheduler/payload
+    # internals that are not part of the C API). Nothing outside the tests
+    # should rely on these; they are not a stable interface.
+    extern "C++" {
+      triton::core::*;
+    };
   local: *;
 };
