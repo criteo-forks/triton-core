@@ -463,19 +463,29 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
   // The wait_for_slots conditional can be blocking till the slots are available
   // for execution. Need to explicitly release the 'mu_' lock to allow the
   // Enqueue threads above to make progress.
+  //
+  // While blocked here, request timeouts are only enforced when the wait
+  // expires, so each wait window is clamped to the closest deadline of the
+  // pending batch (when timeout policies are in use) instead of always
+  // waiting the full 'wait_microseconds'. Without configured timeouts the
+  // behavior is unchanged. Note the clamp tracks the pending batch's
+  // deadlines; requests arriving during the wait are picked up when their
+  // deadline enters the pending batch on a later batching pass.
+  uint64_t clamped_wait_us =
+      ClampWaitToClosestTimeout(wait_microseconds);  // requires 'mu_'
   lock->unlock();
 
-  const std::chrono::microseconds wait_timeout(wait_microseconds);
   std::mutex slot_mu;
   std::unique_lock<std::mutex> slot_lock(slot_mu);
   bool slot_available = false;
 
   while (!slot_available) {
-    slot_available = cv_.wait_for(slot_lock, wait_timeout, [this]() {
-      return model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
-          model_, model_instance_, queue_.SupportPrefetching(),
-          true /* force_non_blocking */, CachedPayloadQueue());
-    });
+    slot_available = cv_.wait_for(
+        slot_lock, std::chrono::microseconds(clamped_wait_us), [this]() {
+          return model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
+              model_, model_instance_, queue_.SupportPrefetching(),
+              true /* force_non_blocking */, CachedPayloadQueue());
+        });
     if (!slot_available) {
       // Reject and release timeout requests from queue.
       std::vector<std::deque<std::unique_ptr<InferenceRequest>>>
@@ -484,6 +494,7 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
         std::lock_guard<std::mutex> lock(mu_);
         queue_.RejectTimeoutRequests();
         queue_.ReleaseSkippedRequests(&rejected_requests, &cancelled_requests);
+        clamped_wait_us = ClampWaitToClosestTimeout(wait_microseconds);
       }
       FinishRejectedCancelledRequests(
           std::move(rejected_requests), std::move(cancelled_requests));
@@ -492,6 +503,35 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
 
   // Recapture the lock.
   lock->lock();
+}
+
+uint64_t
+DynamicBatchScheduler::ClampWaitToClosestTimeout(uint64_t wait_microseconds)
+{
+  // 'mu_' mutex must be held when this function is called.
+  const uint64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  return ClampWaitToDeadline(
+      wait_microseconds, queue_.ClosestTimeout(), now_ns);
+}
+
+uint64_t
+DynamicBatchScheduler::ClampWaitToDeadline(
+    uint64_t wait_microseconds, uint64_t closest_timeout_ns, uint64_t now_ns)
+{
+  if (closest_timeout_ns == 0) {
+    return wait_microseconds;
+  }
+  if (now_ns >= closest_timeout_ns) {
+    // A deadline already expired; use a minimal wait so the caller's next
+    // pass rejects it promptly.
+    return 1000;
+  }
+  // Floor at 1ms to avoid degenerating into a busy poll near a deadline.
+  const uint64_t remaining_us = (closest_timeout_ns - now_ns) / 1000;
+  return std::min(wait_microseconds, std::max(remaining_us, uint64_t(1000)));
 }
 
 uint64_t
