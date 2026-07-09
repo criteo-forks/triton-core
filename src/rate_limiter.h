@@ -43,6 +43,8 @@ namespace triton { namespace core {
 // Limits the rate at which requests are dispatched to the model instances
 class RateLimiter {
  public:
+  // Opaque handle to a model's payload queue; see LookupPayloadQueue().
+  struct PayloadQueue;
   using RateLimiterConfig = inference::ModelRateLimiter;
   using ResourceMap = std::map<int, std::map<std::string, size_t>>;
   enum RESOURCE_KIND_KEY {
@@ -102,16 +104,24 @@ class RateLimiter {
   /// \param force_non_blocking When set true, function will not block for
   /// the availability of the slot.
   /// \return slot availability in boolean.
+  /// \param payload_queue Optional payload queue handle previously obtained
+  /// from LookupPayloadQueue(). When provided, skips the global queue-map
+  /// lookup on this hot path.
   bool PayloadSlotAvailable(
       const TritonModel* model, const TritonModelInstance* model_instance,
-      const bool support_prefetching, const bool force_non_blocking = false);
+      const bool support_prefetching, const bool force_non_blocking = false,
+      PayloadQueue* payload_queue = nullptr);
 
   /// Enqueues the payload to rate limiter for scheduling on the given model.
   /// \param model The pointer to TritonModel object to be removed.
   /// \param payload The shared pointer to the payload object.
+  /// \param payload_queue Optional payload queue handle previously obtained
+  /// from LookupPayloadQueue(). When provided, skips the global queue-map
+  /// lookup on this hot path.
   /// \return Status object indicating success or failure.
   Status EnqueuePayload(
-      const TritonModel* model, std::shared_ptr<Payload> payload);
+      const TritonModel* model, std::shared_ptr<Payload> payload,
+      PayloadQueue* payload_queue = nullptr);
 
   /// Returns the payload that has been scheduled for the given set of model
   /// instances. Note that this call is blocking and depends upon the
@@ -120,9 +130,22 @@ class RateLimiter {
   /// \param instance The pointers to TritonModelInstance objects whose
   /// payload is being requested.
   /// \param payload The shared pointer to the payload object.
+  /// \param payload_queue Optional payload queue handle previously obtained
+  /// from LookupPayloadQueue(). When provided, skips the global queue-map
+  /// lookup on this hot path.
   void DequeuePayload(
       std::deque<TritonModelInstance*>& instance,
-      std::shared_ptr<Payload>* payload);
+      std::shared_ptr<Payload>* payload,
+      PayloadQueue* payload_queue = nullptr);
+
+  /// Returns the payload queue handle for the given model, or nullptr if the
+  /// model has no registered instances yet. The returned pointer remains
+  /// valid until the model is unregistered from the rate limiter (schedulers
+  /// and backend threads are destroyed before that), so callers on the
+  /// inference hot path may cache it to avoid the global map lookup.
+  /// \param model The pointer to TritonModel object to query for.
+  /// \return The payload queue handle.
+  PayloadQueue* LookupPayloadQueue(const TritonModel* model);
 
   /// Returns a new payload object.
   /// \param op_type The operation type for the payload.
@@ -141,7 +164,6 @@ class RateLimiter {
  private:
   class ModelInstanceContext;
   class ModelContext;
-  struct PayloadQueue;
   using StandardReleaseFunc = std::function<void(ModelInstanceContext*)>;
   using StandardScheduleFunc = std::function<void(ModelInstanceContext*)>;
   using StandardStageFunc = std::function<void(ModelInstanceContext*)>;
@@ -296,11 +318,11 @@ class RateLimiter {
   // for the given instance(s) of the model. This implies that the
   // call will wait for an idle runner.
   void WaitForConsumer(
-      const TritonModel* model, const TritonModelInstance* model_instance);
+      PayloadQueue* payload_queue, const TritonModelInstance* model_instance);
   // Returns the number of consumers who have a pending dequeue request for
   // the given instance(s) of the model.
   int WaitingConsumerCount(
-      const TritonModel* model, const TritonModelInstance* model_instance);
+      PayloadQueue* payload_queue, const TritonModelInstance* model_instance);
 
   // Defers scheduling of the payload to the future. Rate Limiter will
   // schedule the payload execution based upon the resource availability/
@@ -356,6 +378,10 @@ class RateLimiter {
   std::vector<std::shared_ptr<Payload>> payload_bucket_;
   std::deque<std::shared_ptr<Payload>> payloads_in_use_;
 
+  // The definition must share the access of the public forward declaration
+  // above (callers hold PayloadQueue* as an opaque handle); the members that
+  // use it stay private.
+ public:
   struct PayloadQueue {
     explicit PayloadQueue(size_t max_batch_size, uint64_t max_queue_delay_ns)
     {
@@ -367,6 +393,8 @@ class RateLimiter {
     std::mutex mu_;
     std::condition_variable cv_;
   };
+
+ private:
   std::map<const TritonModel*, std::unique_ptr<PayloadQueue>> payload_queues_;
 };
 

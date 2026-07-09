@@ -246,8 +246,8 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     auto payload = model_->Server()->GetRateLimiter()->GetPayload(
         Payload::Operation::INFER_RUN, nullptr /* TritonModelInstance*/);
     payload->AddRequest(std::move(request));
-    RETURN_IF_ERROR(
-        model_->Server()->GetRateLimiter()->EnqueuePayload(model_, payload));
+    RETURN_IF_ERROR(model_->Server()->GetRateLimiter()->EnqueuePayload(
+        model_, payload, CachedPayloadQueue()));
 
   } else {
     bool wake_batcher = true;
@@ -268,7 +268,7 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
       // be available.
       wake_batcher = model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
           model_, model_instance_, queue_.SupportPrefetching(),
-          true /*force_non_blocking*/);
+          true /*force_non_blocking*/, CachedPayloadQueue());
 
       // We may wake up runner less often if we don't enforce equal shape
       // within a batch, otherwise must always wake up runner to check it
@@ -434,7 +434,8 @@ DynamicBatchScheduler::BatcherThread(const int nice)
         std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
         CustomBatchFini();
       }
-      model_->Server()->GetRateLimiter()->EnqueuePayload(model_, curr_payload_);
+      model_->Server()->GetRateLimiter()->EnqueuePayload(
+          model_, curr_payload_, CachedPayloadQueue());
     }
 
     // Finish rejected and cancelled requests if any
@@ -464,7 +465,7 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
     slot_available = cv_.wait_for(slot_lock, wait_timeout, [this]() {
       return model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
           model_, model_instance_, queue_.SupportPrefetching(),
-          true /* force_non_blocking */);
+          true /* force_non_blocking */, CachedPayloadQueue());
     });
     if (!slot_available) {
       // Reject and release timeout requests from queue.

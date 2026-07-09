@@ -155,6 +155,27 @@ class DynamicBatchScheduler : public Scheduler {
 
   std::shared_ptr<RateLimiter> rate_limiter_;
 
+  // Cached payload queue handle for 'model_', lazily resolved. The handle
+  // stays valid until the model is unregistered from the rate limiter, which
+  // outlives this scheduler. Atomic because Enqueue() runs on many frontend
+  // threads concurrently (the racing writes all store the same value).
+  std::atomic<RateLimiter::PayloadQueue*> payload_queue_{nullptr};
+
+  // Returns the cached payload queue handle, resolving it on first use.
+  // May return nullptr if no instance has been registered yet.
+  RateLimiter::PayloadQueue* CachedPayloadQueue()
+  {
+    RateLimiter::PayloadQueue* pq =
+        payload_queue_.load(std::memory_order_relaxed);
+    if (pq == nullptr) {
+      pq = rate_limiter_->LookupPayloadQueue(model_);
+      if (pq != nullptr) {
+        payload_queue_.store(pq, std::memory_order_relaxed);
+      }
+    }
+    return pq;
+  }
+
   std::shared_ptr<Payload> curr_payload_;
   bool payload_saturated_;
 
