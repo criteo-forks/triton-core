@@ -31,8 +31,7 @@
 namespace triton { namespace core {
 
 InstanceQueue::InstanceQueue(size_t max_batch_size, uint64_t max_queue_delay_ns)
-    : max_batch_size_(max_batch_size), max_queue_delay_ns_(max_queue_delay_ns),
-      waiting_consumer_count_(0)
+    : max_batch_size_(max_batch_size), max_queue_delay_ns_(max_queue_delay_ns)
 {
 }
 
@@ -122,36 +121,39 @@ InstanceQueue::Dequeue(
 void
 InstanceQueue::IncrementConsumerCount()
 {
-  {
+  waiting_consumer_count_.fetch_add(1);
+  // Only engage the mutex+cv when a WaitForConsumer() caller is blocked.
+  // The seq_cst ordering of the increment above and the flag store in
+  // WaitForConsumer() guarantees either this load sees the waiter flag or
+  // the waiter's predicate check sees the incremented count.
+  if (has_count_waiter_.load()) {
     std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-    waiting_consumer_count_++;
+    waiting_consumer_cv_.notify_one();
   }
-  waiting_consumer_cv_.notify_one();
 }
 
 void
 InstanceQueue::DecrementConsumerCount()
 {
-  {
-    std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-    waiting_consumer_count_--;
-  }
-  waiting_consumer_cv_.notify_one();
+  // A decrement can never satisfy the 'count > 0' wait predicate, so no
+  // notification is needed here.
+  waiting_consumer_count_.fetch_sub(1);
 }
 
 void
 InstanceQueue::WaitForConsumer()
 {
   std::unique_lock<std::mutex> lock(waiting_consumer_mu_);
+  has_count_waiter_.store(true);
   waiting_consumer_cv_.wait(
-      lock, [this]() { return waiting_consumer_count_ > 0; });
+      lock, [this]() { return waiting_consumer_count_.load() > 0; });
+  has_count_waiter_.store(false);
 }
 
 int
 InstanceQueue::WaitingConsumerCount()
 {
-  std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-  return waiting_consumer_count_;
+  return waiting_consumer_count_.load();
 }
 
 }}  // namespace triton::core

@@ -66,7 +66,11 @@ class InstanceQueue {
   // locking discipline, readable without the lock via SizeApprox().
   std::atomic<size_t> size_{0};
 
-  int waiting_consumer_count_;
+  // Consumer bookkeeping runs on every payload enqueue/dequeue, so the
+  // count is atomic and the mutex+cv pair is only engaged by the (rare)
+  // blocking WaitForConsumer() path, signalled via 'has_count_waiter_'.
+  std::atomic<int> waiting_consumer_count_{0};
+  std::atomic<bool> has_count_waiter_{false};
   std::mutex waiting_consumer_mu_;
   std::condition_variable waiting_consumer_cv_;
 };

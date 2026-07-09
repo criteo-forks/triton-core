@@ -26,8 +26,11 @@
 
 #include "instance_queue.h"
 
+#include <chrono>
+#include <future>
 #include <iterator>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -248,6 +251,53 @@ TEST(InstanceQueueTest, SizeApproxTracksMergedDequeues)
   ASSERT_EQ(merged_payloads.size(), static_cast<size_t>(kBurst - 1));
   EXPECT_EQ(queue.SizeApprox(), 0u);
   EXPECT_EQ(queue.SizeApprox(), queue.Size());
+}
+
+// Consumer-count arithmetic with the lock-free counter: increments and
+// decrements must balance exactly, including through negative territory
+// (EnqueuePayload decrements before any consumer parks).
+TEST(InstanceQueueTest, ConsumerCountArithmetic)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+
+  EXPECT_EQ(queue.WaitingConsumerCount(), 0);
+  queue.DecrementConsumerCount();
+  EXPECT_EQ(queue.WaitingConsumerCount(), -1);
+  queue.IncrementConsumerCount();
+  queue.IncrementConsumerCount();
+  EXPECT_EQ(queue.WaitingConsumerCount(), 1);
+}
+
+// WaitForConsumer() must return immediately when a consumer is already
+// counted — no notification required.
+TEST(InstanceQueueTest, WaitForConsumerReturnsWhenConsumerPresent)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+  queue.IncrementConsumerCount();
+
+  auto done = std::async(std::launch::async, [&]() { queue.WaitForConsumer(); });
+  ASSERT_EQ(
+      done.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+      << "WaitForConsumer() blocked although a consumer was already counted";
+}
+
+// Missed-wakeup regression for the waiter-flag protocol: a blocked
+// WaitForConsumer() must be released by a subsequent IncrementConsumerCount()
+// from another thread. With the notification dropped (or the flag/count
+// ordering wrong) this would hang until the 5s guard trips.
+TEST(InstanceQueueTest, WaitForConsumerWokenByIncrement)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+
+  auto done = std::async(std::launch::async, [&]() { queue.WaitForConsumer(); });
+  // Give the waiter time to park; a scheduling delay here only weakens the
+  // test into the immediate-return case, it cannot produce a false failure.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  queue.IncrementConsumerCount();
+  ASSERT_EQ(
+      done.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+      << "IncrementConsumerCount() failed to wake a blocked WaitForConsumer()";
 }
 
 }  // namespace
