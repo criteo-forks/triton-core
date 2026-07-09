@@ -260,25 +260,34 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
       // 'request' and so we can't use it after this point.
       RETURN_IF_ERROR(queue_.Enqueue(request->Priority(), request));
 
-      // If there are any idle runners and the queued batch size is greater or
-      // equal to next preferred batch size, then wake batcher up to service
-      // this request. We do the actual wake outside of the lock to avoid
-      // having the woken thread immediately block on the lock
-      // Explicitly force non-blocking to prevent waiting for the slot to
-      // be available.
-      wake_batcher = model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
-          model_, model_instance_, queue_.SupportPrefetching(),
-          true /*force_non_blocking*/, CachedPayloadQueue());
-
       // We may wake up runner less often if we don't enforce equal shape
       // within a batch, otherwise must always wake up runner to check it
       if (enforce_equal_shape_tensors_.empty()) {
         std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
         auto payload_state = curr_payload_->GetState();
-        wake_batcher &=
+        wake_batcher =
             (payload_saturated_ || IsStaleState(payload_state) ||
              (queued_batch_size_ >= next_preferred_batch_size_));
       }
+    }
+
+    // If there are any idle runners and the queued batch size is greater or
+    // equal to next preferred batch size, then wake batcher up to service
+    // this request. We do the actual wake outside of the lock to avoid
+    // having the woken thread immediately block on the lock.
+    // Explicitly force non-blocking to prevent waiting for the slot to
+    // be available.
+    //
+    // The slot probe is evaluated after releasing 'mu_' on purpose: it
+    // acquires rate-limiter internal locks that are contended by the runner
+    // threads, and holding 'mu_' across it would couple frontend enqueues to
+    // runner-side contention. The wake decision is advisory: a stale answer
+    // at worst delays the batcher wake until the next enqueue or its wait
+    // timeout.
+    if (wake_batcher) {
+      wake_batcher = model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
+          model_, model_instance_, queue_.SupportPrefetching(),
+          true /*force_non_blocking*/, CachedPayloadQueue());
     }
 
     if (wake_batcher) {
