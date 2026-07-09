@@ -584,6 +584,7 @@ target_link_libraries(
     triton-common-logging      # from repo-common
     triton-common-model-config # from repo-common
     proto-library              # from repo-common
+    triton-core
     GTest::gtest
     GTest::gtest_main
     protobuf::libprotobuf
@@ -624,9 +625,11 @@ target_link_libraries(
   PRIVATE
     triton-common-error   # from repo-common
     triton-common-logging # from repo-common
+    proto-library         # from repo-common
     triton-core
     GTest::gtest
     GTest::gtest_main
+    protobuf::libprotobuf
 )
 
 install(
@@ -664,9 +667,11 @@ target_link_libraries(
   PRIVATE
     triton-common-error   # from repo-common
     triton-common-logging # from repo-common
+    proto-library         # from repo-common
     triton-core
     GTest::gtest
     GTest::gtest_main
+    protobuf::libprotobuf
 )
 
 install(
@@ -704,9 +709,11 @@ target_link_libraries(
   PRIVATE
     triton-common-error   # from repo-common
     triton-common-logging # from repo-common
+    proto-library         # from repo-common
     triton-core
     GTest::gtest
     GTest::gtest_main
+    protobuf::libprotobuf
 )
 
 install(
