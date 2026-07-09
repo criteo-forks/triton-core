@@ -123,6 +123,7 @@ RateLimiter::UnregisterModelInstance(TritonModelInstance* triton_model_instance)
       auto s_it = p_it->second->specific_queues_.find(triton_model_instance);
       if (s_it != p_it->second->specific_queues_.end()) {
         p_it->second->specific_queues_.erase(s_it);
+        p_it->second->instance_count_.fetch_sub(1, std::memory_order_relaxed);
       }
     }
   }
@@ -210,17 +211,17 @@ RateLimiter::PayloadSlotAvailable(
 
   bool result;
   if (support_prefetching) {
-    {
-      std::lock_guard<std::mutex> lk(payload_queue->mu_);
-      // The logic below sets cap on the number of payloads that
-      // can be pre-fetched. For per-model batcher the cap is
-      // twice the number of model instances. For per-instance
-      // batcher the cap is 2.
-      size_t multiplier = (model_instance == nullptr)
-                              ? payload_queue->specific_queues_.size()
-                              : 1;
-      result = payload_queue->queue_->Size() < (2 * multiplier);
-    }
+    // The logic below sets cap on the number of payloads that
+    // can be pre-fetched. For per-model batcher the cap is
+    // twice the number of model instances. For per-instance
+    // batcher the cap is 2. The cap is advisory, so lock-free
+    // approximate reads are sufficient here; this probe runs on
+    // every request enqueue and on every batcher wake.
+    size_t multiplier =
+        (model_instance == nullptr)
+            ? payload_queue->instance_count_.load(std::memory_order_relaxed)
+            : 1;
+    result = payload_queue->queue_->SizeApprox() < (2 * multiplier);
   } else {
     result = true;
     if (force_non_blocking) {
@@ -495,6 +496,7 @@ RateLimiter::InitializePayloadQueues(const TritonModelInstance* instance)
           instance,
           new InstanceQueue(
               config.max_batch_size(), max_queue_delay_microseconds * 1000));
+      payload_queue->instance_count_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }

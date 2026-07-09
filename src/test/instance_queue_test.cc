@@ -196,5 +196,59 @@ TEST(InstanceQueueTest, ConsumerCountUnchangedWithoutMerge)
   EXPECT_EQ(queue.WaitingConsumerCount(), 1);
 }
 
+// SizeApprox() mirrors the queue depth without taking the queue lock; it
+// backs the advisory payload prefetch-cap probe. It must track Enqueue and
+// plain Dequeue exactly at quiescence.
+TEST(InstanceQueueTest, SizeApproxTracksEnqueueDequeue)
+{
+  constexpr size_t kMaxBatchSize = 8;
+  // Zero delay: payload merging disabled, dequeues pop exactly one payload.
+  InstanceQueue queue(kMaxBatchSize, 0 /* max_queue_delay_ns */);
+
+  EXPECT_EQ(queue.SizeApprox(), 0u);
+
+  constexpr int kCount = 5;
+  for (int i = 0; i < kCount; ++i) {
+    queue.Enqueue(MakeInferPayload());
+    EXPECT_EQ(queue.SizeApprox(), static_cast<size_t>(i + 1));
+    EXPECT_EQ(queue.SizeApprox(), queue.Size());
+  }
+
+  for (int i = kCount; i > 0; --i) {
+    std::shared_ptr<Payload> payload;
+    std::vector<std::shared_ptr<Payload>> merged_payloads;
+    queue.Dequeue(&payload, &merged_payloads);
+    EXPECT_TRUE(merged_payloads.empty());
+    EXPECT_EQ(queue.SizeApprox(), static_cast<size_t>(i - 1));
+    EXPECT_EQ(queue.SizeApprox(), queue.Size());
+  }
+}
+
+// A merging dequeue removes the primary payload plus every merged payload;
+// SizeApprox() must account for all of them, or the prefetch cap would
+// permanently believe the queue is fuller than it is and throttle the
+// batcher.
+TEST(InstanceQueueTest, SizeApproxTracksMergedDequeues)
+{
+  constexpr size_t kMaxBatchSize = 8;
+  constexpr uint64_t kMaxQueueDelayNs = 1000;  // merging enabled
+  constexpr int kBurst = 3;
+
+  InstanceQueue queue(kMaxBatchSize, kMaxQueueDelayNs);
+
+  for (int b = 0; b < kBurst; ++b) {
+    queue.Enqueue(MakeInferPayload());
+  }
+  ASSERT_EQ(queue.SizeApprox(), static_cast<size_t>(kBurst));
+
+  std::shared_ptr<Payload> payload;
+  std::vector<std::shared_ptr<Payload>> merged_payloads;
+  queue.Dequeue(&payload, &merged_payloads);
+
+  ASSERT_EQ(merged_payloads.size(), static_cast<size_t>(kBurst - 1));
+  EXPECT_EQ(queue.SizeApprox(), 0u);
+  EXPECT_EQ(queue.SizeApprox(), queue.Size());
+}
+
 }  // namespace
 }}  // namespace triton::core

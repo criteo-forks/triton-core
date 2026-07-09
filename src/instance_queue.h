@@ -25,6 +25,8 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <atomic>
+
 #include "payload.h"
 
 namespace triton { namespace core {
@@ -40,6 +42,9 @@ class InstanceQueue {
 
   size_t Size();
   bool Empty();
+  // Lock-free approximate size for advisory checks (e.g. the payload
+  // prefetch cap); may lag concurrent enqueues/dequeues.
+  size_t SizeApprox() const { return size_.load(std::memory_order_relaxed); }
   void Enqueue(const std::shared_ptr<Payload>& payload);
   void Dequeue(
       std::shared_ptr<Payload>* payload,
@@ -57,6 +62,9 @@ class InstanceQueue {
   std::deque<std::shared_ptr<Payload>> payload_queue_;
   std::shared_ptr<Payload> staged_payload_;
   std::mutex mu_;
+  // Mirrors payload_queue_.size(); maintained under 'mu_' by the callers'
+  // locking discipline, readable without the lock via SizeApprox().
+  std::atomic<size_t> size_{0};
 
   int waiting_consumer_count_;
   std::mutex waiting_consumer_mu_;

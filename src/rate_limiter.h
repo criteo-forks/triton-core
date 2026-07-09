@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -390,6 +391,9 @@ class RateLimiter {
     std::unique_ptr<InstanceQueue> queue_;
     std::map<const TritonModelInstance*, std::unique_ptr<InstanceQueue>>
         specific_queues_;
+    // Mirrors specific_queues_.size(); readable without holding 'mu_' for
+    // advisory checks like the payload prefetch cap.
+    std::atomic<size_t> instance_count_{0};
     std::mutex mu_;
     std::condition_variable cv_;
   };
