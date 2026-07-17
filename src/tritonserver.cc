@@ -1970,6 +1970,25 @@ TRITONSERVER_InferenceRequestRemoveAllInputs(
 }
 
 TRITONAPI_DECLSPEC TRITONSERVER_Error*
+TRITONSERVER_InferenceRequestReset(
+    TRITONSERVER_InferenceRequest* inference_request,
+    TRITONSERVER_Server* server, const char* model_name,
+    const int64_t model_version)
+{
+  tc::InferenceRequest* lrequest =
+      reinterpret_cast<tc::InferenceRequest*>(inference_request);
+  tc::InferenceServer* lserver = reinterpret_cast<tc::InferenceServer*>(server);
+
+  // Re-resolve the model exactly like TRITONSERVER_InferenceRequestNew so a
+  // reload/unload since the previous inference is honored.
+  std::shared_ptr<tc::Model> model;
+  RETURN_IF_STATUS_ERROR(lserver->GetModel(model_name, model_version, &model));
+
+  RETURN_IF_STATUS_ERROR(lrequest->Reset(model, model_version));
+  return nullptr;  // Success
+}
+
+TRITONAPI_DECLSPEC TRITONSERVER_Error*
 TRITONSERVER_InferenceRequestAppendInputData(
     TRITONSERVER_InferenceRequest* inference_request, const char* name,
     const void* base, size_t byte_size, TRITONSERVER_MemoryType memory_type,

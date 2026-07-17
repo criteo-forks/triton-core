@@ -893,6 +893,80 @@ InferenceRequest::RemoveAllOriginalRequestedOutputs()
 }
 
 Status
+InferenceRequest::Reset(
+    const std::shared_ptr<Model>& model, const int64_t requested_model_version)
+{
+  if ((state_ != InferenceRequest::State::RELEASED) &&
+      (state_ != InferenceRequest::State::FAILED_ENQUEUE) &&
+      (state_ != InferenceRequest::State::INITIALIZED)) {
+    std::stringstream ss;
+    ss << LogRequest()
+       << "Reset() is only allowed for a request in RELEASED, "
+          "FAILED_ENQUEUE or INITIALIZED state, current state is "
+       << state_;
+    return Status(Status::Code::INTERNAL, ss.str());
+  }
+
+  // Rebind to the (re-resolved) model before resetting the fields below:
+  // the model may have been reloaded since the previous inference, and
+  // SetPriority() normalizes against the model configuration.
+  model_shared_ = model;
+  model_raw_ = model.get();
+  requested_model_version_ = requested_model_version;
+
+  id_.clear();
+  flags_ = 0;
+  correlation_id_ = uint64_t(0);
+  batch_size_ = 0;
+  timeout_us_ = 0;
+  SetPriority(0);
+
+  cache_key_.clear();
+  cache_key_is_set_ = false;
+
+  original_inputs_.clear();
+  override_inputs_.clear();
+  inputs_.clear();
+  original_requested_outputs_.clear();
+  requested_outputs_.clear();
+  raw_input_name_.clear();
+  raw_input_size_ = 0;
+
+  // Use a deque so there is no reallocation; clear it here so a reused
+  // request does not carry over parameters from a previous inference.
+  parameters_.clear();
+
+  // A stale delegator would silently redirect responses of the next
+  // inference to the previous caller's logic, so it must not survive reuse.
+  response_delegator_ = nullptr;
+
+  sequence_states_.reset();
+
+  null_request_ = false;
+  collect_stats_ = true;
+
+  queue_start_ns_ = 0;
+  cache_lookup_start_ns_ = 0;
+  cache_lookup_end_ns_ = 0;
+  cache_insertion_start_ns_ = 0;
+  cache_insertion_end_ns_ = 0;
+  batcher_start_ns_ = 0;
+
+#ifdef TRITON_ENABLE_STATS
+  request_start_ns_ = 0;
+  secondary_stats_aggregator_ = nullptr;
+#endif  // TRITON_ENABLE_STATS
+
+#ifdef TRITON_ENABLE_TRACING
+  trace_ = nullptr;
+#endif  // TRITON_ENABLE_TRACING
+
+  needs_normalization_ = true;
+
+  return Status::Success;
+}
+
+Status
 InferenceRequest::PrepareForInference()
 {
   // Remove override inputs as those are added during any previous

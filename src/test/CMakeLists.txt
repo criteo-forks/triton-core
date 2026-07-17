@@ -596,6 +596,61 @@ install(
 )
 
 #
+# Unit test for InferenceRequest reuse (Reset() / response factory reuse)
+#
+add_executable(
+  request_reuse_test
+  request_reuse_test.cc
+)
+
+set_target_properties(
+  request_reuse_test
+  PROPERTIES
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    INSTALL_RPATH ""
+)
+
+target_include_directories(
+  request_reuse_test
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${GTEST_INCLUDE_DIRS}
+)
+
+# Must match the definitions triton-core compiles infer_request.h /
+# infer_response.h with, or the ifdef'd members change the object layout
+# seen by this test relative to the linked library.
+target_compile_definitions(
+  request_reuse_test
+  PRIVATE
+    TRITON_ENABLE_LOGGING=1
+    $<$<BOOL:${TRITON_ENABLE_STATS}>:TRITON_ENABLE_STATS=1>
+    $<$<BOOL:${TRITON_ENABLE_METRICS}>:TRITON_ENABLE_METRICS=1>
+    $<$<BOOL:${TRITON_ENABLE_TRACING}>:TRITON_ENABLE_TRACING=1>
+)
+
+target_link_libraries(
+  request_reuse_test
+  PRIVATE
+    triton-common-error   # from repo-common
+    triton-common-logging # from repo-common
+    proto-library         # from repo-common
+    triton-core
+    GTest::gtest
+    GTest::gtest_main
+    prometheus-cpp::core  # metrics.h reached via TRITON_ENABLE_METRICS
+    protobuf::libprotobuf
+)
+
+install(
+  TARGETS request_reuse_test
+  RUNTIME DESTINATION bin
+)
+
+#
 # Unit test for Payload
 #
 add_executable(

@@ -1299,6 +1299,32 @@ TRITONSERVER_DECLSPEC struct TRITONSERVER_Error*
 TRITONSERVER_InferenceRequestRemoveAllInputs(
     struct TRITONSERVER_InferenceRequest* inference_request);
 
+/// Reset a released request so that it can be reused for a new inference
+/// instead of being deleted, rebinding it to the requested model exactly as
+/// if it had been created by TRITONSERVER_InferenceRequestNew (the model is
+/// re-resolved so a reload or unload since the previous inference is
+/// honored). Only valid while the request is not in flight, i.e. after its
+/// release callback has been invoked (or before it has ever been run). After
+/// a successful reset the request holds no inputs, outputs, parameters or
+/// callbacks; the caller must add inputs and requested outputs, and re-set
+/// the release and response callbacks (via
+/// TRITONSERVER_InferenceRequestSetReleaseCallback and
+/// TRITONSERVER_InferenceRequestSetResponseCallback) before using the request
+/// again.
+///
+/// \param inference_request The request object.
+/// \param server The inference server object.
+/// \param model_name The name of the model to use for the next inference.
+/// \param model_version The version of the model to use for the next
+/// inference. If -1 then the server will choose a version based on the
+/// model's policy.
+/// \return a TRITONSERVER_Error indicating success or failure.
+TRITONSERVER_DECLSPEC struct TRITONSERVER_Error*
+TRITONSERVER_InferenceRequestReset(
+    struct TRITONSERVER_InferenceRequest* inference_request,
+    struct TRITONSERVER_Server* server, const char* model_name,
+    const int64_t model_version);
+
 /// Assign a buffer of data to an input. The buffer will be appended
 /// to any existing buffers for that input. The 'inference_request'
 /// object takes ownership of the buffer and so the caller should not
