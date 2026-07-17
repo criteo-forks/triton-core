@@ -204,7 +204,7 @@ RateLimiter::PayloadSlotAvailable(
     payload_queue = LookupPayloadQueue(model);
     if (payload_queue == nullptr) {
       LOG_ERROR << "Unable to find the payload queue for the model "
-                << model->Name();
+                << (model ? model->Name() : std::string("<null>"));
       return false;
     }
   }
@@ -244,7 +244,8 @@ RateLimiter::EnqueuePayload(
     if (payload_queue == nullptr) {
       return Status(
           Status::Code::INTERNAL,
-          "Unable to find the payload queue for the model " + model->Name());
+          "Unable to find the payload queue for the model " +
+              (model ? model->Name() : std::string("<null>")));
     }
   }
 
