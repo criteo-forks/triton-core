@@ -41,6 +41,7 @@
 #include "rate_limiter.h"
 #include "scheduler.h"
 #include "scheduler_utils.h"
+#include "staging_queue.h"
 #include "status.h"
 #include "triton/common/model_config.h"
 
@@ -79,10 +80,15 @@ class DynamicBatchScheduler : public Scheduler {
   size_t InflightInferenceCount() override
   {
     std::unique_lock<std::mutex> lock(mu_);
+    // 'staging_' holds requests handed off by frontend threads that the
+    // batcher hasn't yet drained into 'queue_'; its size is best-effort
+    // (see StagingQueue::Size()), which is acceptable for this diagnostic
+    // count.
+    size_t count = queue_.Size() + staging_.Size();
     if (curr_payload_ != nullptr) {
-      return queue_.Size() + curr_payload_->RequestCount();
+      count += curr_payload_->RequestCount();
     }
-    return queue_.Size();
+    return count;
   }
 
   // \see Scheduler::Stop()
@@ -103,6 +109,14 @@ class DynamicBatchScheduler : public Scheduler {
   void BatcherThread(const int nice);
   void NewPayload();
   uint64_t GetDynamicBatch();
+
+  // Drains all requests staged via 'staging_' into 'queue_', applying the
+  // same per-priority enqueue logic the old single-mutex Enqueue() critical
+  // section used. 'mu_' must be held when this function is called. Returns
+  // any requests that could not be enqueued because their priority level was
+  // already at its configured max_queue_size (see the max_queue_size
+  // deviation note next to FinishStagingRejectedRequests() in the .cc file).
+  std::deque<std::unique_ptr<InferenceRequest>> DrainStagingToQueue();
   void DelegateResponse(std::unique_ptr<InferenceRequest>& request);
   void CacheLookUp(
       std::unique_ptr<InferenceRequest>& request,
@@ -157,8 +171,17 @@ class DynamicBatchScheduler : public Scheduler {
   // Map from priority level to queue holding inference requests for the model
   // represented by this scheduler. If priority queues are not supported by the
   // scheduler, then priority zero entry is used as the single queue.
+  // Owned exclusively by the batcher thread; frontend threads never touch it
+  // directly, they hand requests off through 'staging_' instead (see
+  // DrainStagingToQueue()).
   PriorityQueue queue_;
   bool stop_;
+
+  // Small hand-off queue frontend (Enqueue()) threads push into, with its
+  // own tiny lock. The batcher thread drains it into 'queue_' instead of
+  // enqueuing directly, so frontend threads no longer contend with 'mu_'
+  // across the batcher's (potentially long) batch-formation iteration.
+  StagingQueue<InferenceRequest> staging_;
 
   std::thread scheduler_thread_;
   std::atomic<bool> scheduler_thread_exit_;
@@ -166,6 +189,14 @@ class DynamicBatchScheduler : public Scheduler {
   // Mutex and condvar for signaling scheduler thread
   std::mutex mu_;
   std::condition_variable cv_;
+
+  // Set (while holding 'mu_') immediately before the batcher thread parks in
+  // cv_.wait_for() and cleared right after it wakes. Enqueue() uses it to
+  // close a lost-wakeup race: when a producer's advisory wake check sees
+  // this true, it takes an empty lock on 'mu_' before notifying, which
+  // serializes it with the batcher's wait/wake transition (see BatcherThread
+  // and Enqueue() in the .cc file for the two halves of this handshake).
+  std::atomic<bool> batcher_idle_{false};
 
   std::shared_ptr<RateLimiter> rate_limiter_;
 
@@ -191,7 +222,10 @@ class DynamicBatchScheduler : public Scheduler {
   }
 
   std::shared_ptr<Payload> curr_payload_;
-  bool payload_saturated_;
+  // Read by Enqueue() (frontend threads) as part of the advisory wake
+  // decision, written by the batcher thread (NewPayload(), GetDynamicBatch());
+  // relaxed ordering is sufficient since a stale read only delays a wake.
+  std::atomic<bool> payload_saturated_;
 
   size_t max_batch_size_;
   size_t max_preferred_batch_size_;
@@ -199,8 +233,12 @@ class DynamicBatchScheduler : public Scheduler {
   uint64_t pending_batch_delay_ns_;
   size_t pending_batch_size_;
 
-  size_t queued_batch_size_;
-  size_t next_preferred_batch_size_;
+  // Read by Enqueue() (frontend threads) as part of the advisory wake
+  // decision, updated by frontend threads (fetch_add) and by the batcher
+  // thread (GetDynamicBatch()); relaxed ordering is sufficient, see
+  // StagingQueue's own comment for the same tradeoff.
+  std::atomic<size_t> queued_batch_size_;
+  std::atomic<size_t> next_preferred_batch_size_;
 
   // The input tensors that require shape checking before being
   // allowed in a batch. As a map from the tensor name to a bool. If
