@@ -89,7 +89,8 @@ DynamicBatchScheduler::DynamicBatchScheduler(
       model_name_(model->Name()),
       dynamic_batching_enabled_(dynamic_batching_enabled),
       queue_(default_queue_policy, priority_levels, queue_policy_map),
-      stop_(false), max_batch_size_((size_t)std::max(1, max_batch_size)),
+      stop_(false), draining_(false),
+      max_batch_size_((size_t)std::max(1, max_batch_size)),
       preferred_batch_sizes_(preferred_batch_sizes),
       pending_batch_delay_ns_(max_queue_delay_microseconds * 1000),
       pending_batch_size_(0), queued_batch_size_(0),
@@ -184,12 +185,12 @@ DynamicBatchScheduler::~DynamicBatchScheduler()
 Status
 DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 {
-  if (stop_) {
+  if (stop_.load()) {
     return Status(
         Status::Code::UNAVAILABLE,
         request->LogRequest() +
-            "Server is stopping, scheduler for model has stopped accepting new "
-            "inference requests");
+            "Server is stopping, scheduler for model has stopped accepting "
+            "new inference requests");
   }
   // If queue start timestamp hasn't been set, queue timer starts at
   // the beginning of the queueing and scheduling process. Otherwise,
@@ -254,6 +255,20 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     {
       std::lock_guard<std::mutex> lock(mu_);
 
+      // Shutdown may have started after the initial check above while this
+      // request was doing queue bookkeeping or a response-cache lookup. The
+      // check under mu_ is the ownership-transfer linearization point: either
+      // this request enters the queue before shutdown starts, or it is
+      // rejected. This also prevents the batcher from observing an empty queue
+      // and exiting immediately before this enqueue.
+      if (stop_.load()) {
+        return Status(
+            Status::Code::UNAVAILABLE,
+            request->LogRequest() +
+                "Server is stopping, scheduler for model has stopped accepting "
+                "new inference requests");
+      }
+
       queued_batch_size_ += std::max(1U, request->BatchSize());
 
       // Assuming no error is returned, this call takes ownership of
@@ -290,6 +305,12 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 }
 
 void
+DynamicBatchScheduler::Stop()
+{
+  stop_.store(true);
+}
+
+void
 DynamicBatchScheduler::NewPayload()
 {
   curr_payload_ = model_->Server()->GetRateLimiter()->GetPayload(
@@ -297,6 +318,10 @@ DynamicBatchScheduler::NewPayload()
   payload_saturated_ = false;
   CustomBatchInit();
 }
+
+// How long Shutdown() lets the batcher keep serving accepted requests
+// before the remainder is failed on thread exit.
+constexpr std::chrono::seconds kShutdownDrainTimeout(30);
 
 void
 DynamicBatchScheduler::BatcherThread(const int nice)
@@ -344,6 +369,23 @@ DynamicBatchScheduler::BatcherThread(const int nice)
         if (payload_saturated_ || IsStaleState(payload_state)) {
           NewPayload();
           next_preferred_batch_size_ = 0;
+        }
+      }
+
+      // When draining (model unload), exit once every accepted request
+      // has been dispatched, or once the drain deadline expires; the
+      // thread-exit flush below fails whatever remains.
+      if (draining_.load()) {
+        bool payload_idle = true;
+        {
+          std::lock_guard<std::mutex> exec_lock(
+              *(curr_payload_->GetExecMutex()));
+          const auto payload_state = curr_payload_->GetState();
+          payload_idle = (curr_payload_->RequestCount() == 0) ||
+                         IsStaleState(payload_state);
+        }
+        if ((queue_.Empty() && payload_idle) || DrainDeadlinePassed()) {
+          break;
         }
       }
 
@@ -442,8 +484,97 @@ DynamicBatchScheduler::BatcherThread(const int nice)
         std::move(rejected_requests), std::move(cancelled_requests));
   }  // end runner loop
 
+  // Fail every request this batcher still holds. Requests keep the model
+  // alive through their shared_ptr, and a request parked in an unsent
+  // partial batch or in the queue would otherwise pin the model's
+  // reference count above zero forever: ~TritonModel would never run
+  // after unload and the model's memory would stay resident until
+  // process restart.
+  {
+    std::vector<std::deque<std::unique_ptr<InferenceRequest>>> flushed(1);
+    std::vector<std::deque<std::unique_ptr<InferenceRequest>>>
+        rejected_requests, cancelled_requests;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      {
+        std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
+        const auto payload_state = curr_payload_->GetState();
+        // EXECUTING/RELEASED payloads are owned by the backend at this
+        // point; only reclaim requests from payloads this thread never
+        // handed off.
+        if ((payload_state == Payload::State::UNINITIALIZED) ||
+            (payload_state == Payload::State::READY)) {
+          // NewPayload() initializes custom-batcher state even before the
+          // payload receives a request. Balance that initialization when
+          // shutdown discards an empty or partial payload instead of handing
+          // it to the rate limiter.
+          CustomBatchFini();
+          for (auto& request : curr_payload_->Requests()) {
+            if (request != nullptr) {
+              flushed[0].emplace_back(std::move(request));
+            }
+          }
+          curr_payload_->Requests().clear();
+        }
+      }
+      queue_.ReleaseSkippedRequests(&rejected_requests, &cancelled_requests);
+      while (!queue_.Empty()) {
+        std::unique_ptr<InferenceRequest> request;
+        if (!queue_.Dequeue(&request).IsOk()) {
+          break;
+        }
+        flushed[0].emplace_back(std::move(request));
+      }
+    }
+    if (!flushed[0].empty()) {
+      LOG_INFO << "Dynamic-batcher for " << model_name_ << " failing "
+               << flushed[0].size() << " undispatched request(s) on shutdown";
+      FinishSkippedRequests(
+          std::move(flushed),
+          Status(
+              Status::Code::UNAVAILABLE,
+              "Scheduler for model has stopped, request was never dispatched"),
+          FailureReason::OTHER);
+    }
+    FinishRejectedCancelledRequests(
+        std::move(rejected_requests), std::move(cancelled_requests));
+  }
+
   LOG_VERBOSE(1) << "Stopping dynamic-batcher thread for " << model_name_
                  << "...";
+}
+
+void
+DynamicBatchScheduler::Shutdown()
+{
+  // Reject requests that arrive from now on (checked in Enqueue), then
+  // let the batcher DRAIN: it keeps dispatching until every request it
+  // already accepted has been served, and only then exits its runner
+  // loop. The deadline bounds the drain: a batcher that can no longer
+  // dispatch (e.g. broken payload-slot accounting) would otherwise never
+  // empty its queue or partial batch, and the requests it holds would
+  // pin the model in memory through their shared_ptr references. Any
+  // request remaining past the deadline is failed on thread exit. Do
+  // not join here: this is called from the model-unload path and the
+  // batcher thread finishes on its own; ~DynamicBatchScheduler performs
+  // the join.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (draining_.load()) {
+      return;
+    }
+
+    // This mutex is also held by Enqueue at the point where it transfers
+    // ownership to queue_, and by BatcherThread when it decides that the
+    // drained queue is empty. This makes all three outcomes linearizable and
+    // prevents a late enqueue from being stranded after the batcher exits.
+    stop_.store(true);
+    drain_deadline_ = std::chrono::steady_clock::now() + kShutdownDrainTimeout;
+    // Publish the deadline only after it has been initialized. Shutdown is
+    // idempotent, so drain_deadline_ is never rewritten while readers use it.
+    draining_.store(true);
+  }
+  cv_.notify_all();
 }
 
 void
@@ -460,11 +591,18 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
   std::unique_lock<std::mutex> slot_lock(slot_mu);
   bool slot_available = false;
 
-  while (!slot_available) {
+  // Also give up when the scheduler is exiting: this wait has no other
+  // exit path, and a batcher thread stuck here (e.g. when the rate
+  // limiter's waiting-consumer accounting is wrong and a slot never
+  // becomes available) would block ~DynamicBatchScheduler's join()
+  // forever, wedging model unload with its GPU memory still resident.
+  while (!slot_available && !scheduler_thread_exit_.load() &&
+         !DrainDeadlinePassed()) {
     slot_available = cv_.wait_for(slot_lock, wait_timeout, [this]() {
-      return model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
-          model_, model_instance_, queue_.SupportPrefetching(),
-          true /* force_non_blocking */);
+      return scheduler_thread_exit_.load() || DrainDeadlinePassed() ||
+             model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
+                 model_, model_instance_, queue_.SupportPrefetching(),
+                 true /* force_non_blocking */);
     });
     if (!slot_available) {
       // Reject and release timeout requests from queue.

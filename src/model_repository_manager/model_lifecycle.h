@@ -251,6 +251,16 @@ class ModelLifeCycle {
       state_ = ModelReadyState::UNLOADING;
       state_reason_.clear();
       agent_model_list_.reset();
+      // Shut down the scheduler before dropping the reference. Requests
+      // still held by the scheduler (queued, or parked in an unsent
+      // partial batch) own shared_ptr references to the model; without
+      // an explicit shutdown they can pin the model's reference count
+      // above zero indefinitely, so the model is never destroyed, its
+      // memory is never freed, and its metric series persist ("zombie"
+      // models that survive until process restart).
+      if (model_ != nullptr) {
+        model_->ShutdownScheduler();
+      }
       model_.reset();
     }
 

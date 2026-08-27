@@ -234,6 +234,16 @@ class Model {
   // Stop processing future requests unless they are considered as in-flight.
   void Stop() { scheduler_->Stop(); }
 
+  // Start scheduler-specific unload handling. Dynamic batching drains or
+  // fails undispatched requests so they release their shared_ptr references
+  // to this model; other schedulers fall back to their Stop() behavior.
+  void ShutdownScheduler()
+  {
+    if (scheduler_ != nullptr) {
+      scheduler_->Shutdown();
+    }
+  }
+
   uint64_t DefaultPriorityLevel() const { return default_priority_level_; }
 
   uint64_t MaxPriorityLevel() const { return max_priority_level_; }

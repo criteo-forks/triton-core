@@ -77,7 +77,7 @@ class SequenceBatchScheduler : public Scheduler {
   }
 
   // \see Scheduler::Stop()
-  void Stop() override { stop_ = true; }
+  void Stop() override { stop_.store(true); }
 
   // Update the scheduler to the new set of model instances. This function
   // cannot be called concurrently.
@@ -195,7 +195,7 @@ class SequenceBatchScheduler : public Scheduler {
   uint64_t max_sequence_idle_microseconds_;
 
   // Whether this scheduler has stopped accepting new inference requests.
-  bool stop_;
+  std::atomic<bool> stop_;
 
   // Mutex
   std::mutex mu_;

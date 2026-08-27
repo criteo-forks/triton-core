@@ -478,7 +478,6 @@ SequenceBatchScheduler::~SequenceBatchScheduler()
   removed_batchers_.clear();
 }
 
-
 namespace {
 
 Status
@@ -700,7 +699,7 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
 
   // Check if the request is one of the in-flight sequence (not starting new
   // sequence), we consider sequences in backlog as also in-flight.
-  if (stop_ && seq_start) {
+  if (stop_.load() && seq_start) {
     return Status(
         Status::Code::UNAVAILABLE,
         "Server is stopping, scheduler for model has stopped accepting new "
