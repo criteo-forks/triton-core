@@ -1,4 +1,4 @@
-// Copyright 2018-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -512,6 +512,15 @@ class ModelRepositoryManager {
 
   Status FindModelIdentifier(
       const std::string& model_name, ModelIdentifier* model_id);
+
+  /// Report that a reference to a model version was leaked by a frontend
+  /// (e.g. a dropped reply hand-off); the repository index reports the
+  /// version's unload as stuck immediately.
+  /// \param model_name The name of the model.
+  /// \param model_version The version of the model; < 0 marks all versions.
+  /// \return error status.
+  Status ReportModelLeakedReference(
+      const std::string& model_name, const int64_t model_version);
 
   /// Get the index of all models in all repositories.
   /// \param ready_only If true return only index of models that are ready.

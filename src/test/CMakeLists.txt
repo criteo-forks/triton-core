@@ -712,3 +712,40 @@ install(
   TARGETS input_byte_size_test
   RUNTIME DESTINATION bin
 )
+
+#
+# Reported model state (repository-index reason for stuck/leaked versions)
+#
+add_executable(
+  model_state_report_test
+  model_state_report_test.cc
+  ../model_repository_manager/model_state_report.h
+)
+
+set_target_properties(
+  model_state_report_test
+  PROPERTIES
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    INSTALL_RPATH ""
+)
+
+target_include_directories(
+  model_state_report_test
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${GTEST_INCLUDE_DIRS}
+)
+
+target_link_libraries(
+  model_state_report_test
+  PRIVATE
+    GTest::gtest
+)
+
+install(
+  TARGETS model_state_report_test
+  RUNTIME DESTINATION bin
+)
+

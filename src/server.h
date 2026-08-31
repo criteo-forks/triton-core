@@ -101,6 +101,12 @@ class InferenceServer {
   // Model health
   Status ModelIsReady(const Model& model, bool* ready);
 
+  // Report a reference to a model version leaked by a frontend (e.g. a
+  // dropped reply hand-off); the repository index reports the version's
+  // unload as stuck immediately. 'model_version' < 0 marks all versions.
+  Status ReportModelLeakedReference(
+      const std::string& model_name, const int64_t model_version);
+
   // Return the ready versions of specific model
   Status ModelReadyVersions(
       const std::string& model_name, std::vector<int64_t>* versions);

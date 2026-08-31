@@ -1,4 +1,4 @@
-// Copyright 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -28,6 +28,8 @@
 #include "model_lifecycle.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <stdexcept>
@@ -48,6 +50,63 @@
 #include "server.h"
 
 namespace triton { namespace core {
+
+namespace {
+
+// An UNLOADING version older than this is reported as stuck. Tunable per
+// pod: TRITON_STUCK_UNLOAD_THRESHOLD_SECONDS (default 60; 0 disables).
+int64_t
+StuckUnloadThresholdNs()
+{
+  static const int64_t threshold_ns = [] {
+    int64_t seconds = 60;
+    const char* env = std::getenv("TRITON_STUCK_UNLOAD_THRESHOLD_SECONDS");
+    if (env != nullptr) {
+      char* end = nullptr;
+      const long long parsed = std::strtoll(env, &end, 10);
+      if ((end != env) && (*end == '\0') && (parsed >= 0)) {
+        seconds = parsed;
+      } else {
+        LOG_WARNING
+            << "ignoring invalid TRITON_STUCK_UNLOAD_THRESHOLD_SECONDS='" << env
+            << "', using " << seconds << "s";
+      }
+    }
+    return seconds * 1000000000LL;
+  }();
+  return threshold_ns;
+}
+
+}  // namespace
+
+std::pair<ModelReadyState, std::string>
+ModelLifeCycle::ModelInfo::ReportedState()
+{
+  int64_t unloading_for_ns = -1;
+  if ((state_ == ModelReadyState::UNLOADING) && (unload_start_ns_ != 0)) {
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    unloading_for_ns = now_ns - static_cast<int64_t>(unload_start_ns_);
+  }
+  // use_count() is approximate under concurrency, which is fine for
+  // reporting: any non-zero value means destruction cannot have run.
+  auto reported = ReportedModelState(
+      state_, state_reason_, leaked_refs_, unloading_for_ns,
+      StuckUnloadThresholdNs(), weak_model_.use_count());
+  // One-shot warning when the timeout first flags this version as stuck
+  // (a reported leak already logged at report time).
+  if ((leaked_refs_ == 0) && !stuck_logged_ &&
+      (reported.second != state_reason_)) {
+    stuck_logged_ = true;
+    LOG_WARNING << "model '" << model_path_
+                << "' unload is stuck; the version remains resident until "
+                   "process restart ("
+                << reported.second << ")";
+  }
+  return reported;
+}
 
 const std::string&
 ModelReadyStateString(ModelReadyState state)
@@ -282,8 +341,7 @@ ModelLifeCycle::ModelStates()
 
     for (auto& version_model : model_version.second) {
       std::lock_guard<std::mutex> lock(version_model.second->mtx_);
-      version_map[version_model.first] = std::make_pair(
-          version_model.second->state_, version_model.second->state_reason_);
+      version_map[version_model.first] = version_model.second->ReportedState();
     }
 
     model_states[model_version.first] = std::move(version_map);
@@ -302,12 +360,42 @@ ModelLifeCycle::VersionStates(const ModelIdentifier& model_id)
   if (mit != map_.end()) {
     for (auto& version_model : mit->second) {
       std::lock_guard<std::mutex> lock(version_model.second->mtx_);
-      version_map[version_model.first] = std::make_pair(
-          version_model.second->state_, version_model.second->state_reason_);
+      version_map[version_model.first] = version_model.second->ReportedState();
     }
   }
 
   return version_map;
+}
+
+Status
+ModelLifeCycle::ReportLeakedReference(
+    const ModelIdentifier& model_id, const int64_t model_version)
+{
+  if (model_version < 0) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        "leaked reference reports require a non-negative model version");
+  }
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  auto mit = map_.find(model_id);
+  if (mit == map_.end()) {
+    return Status(
+        Status::Code::NOT_FOUND, "model '" + model_id.str() + "' is not found");
+  }
+  auto vit = mit->second.find(model_version);
+  if (vit == mit->second.end()) {
+    return Status(
+        Status::Code::NOT_FOUND, "model '" + model_id.str() + "', version " +
+                                     std::to_string(model_version) +
+                                     " is not found");
+  }
+  std::lock_guard<std::mutex> lock(vit->second->mtx_);
+  ++vit->second->leaked_refs_;
+  LOG_WARNING << "model '" << model_id.str() << "' version " << model_version
+              << ": leaked reference reported (" << vit->second->leaked_refs_
+              << " total); unload of this version will not complete until "
+                 "process restart";
+  return Status::Success;
 }
 
 Status
