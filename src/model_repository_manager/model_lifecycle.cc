@@ -28,6 +28,8 @@
 #include "model_lifecycle.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <stdexcept>
@@ -48,6 +50,62 @@
 #include "server.h"
 
 namespace triton { namespace core {
+
+namespace {
+
+// An UNLOADING version older than this is reported as stuck. Tunable per
+// pod: TRITON_STUCK_UNLOAD_THRESHOLD_SECONDS (default 60; 0 disables).
+int64_t
+StuckUnloadThresholdNs()
+{
+  static const int64_t threshold_ns = [] {
+    int64_t seconds = 60;
+    const char* env = std::getenv("TRITON_STUCK_UNLOAD_THRESHOLD_SECONDS");
+    if (env != nullptr) {
+      char* end = nullptr;
+      const long long parsed = std::strtoll(env, &end, 10);
+      if ((end != env) && (*end == '\0') && (parsed >= 0)) {
+        seconds = parsed;
+      } else {
+        LOG_WARNING
+            << "ignoring invalid TRITON_STUCK_UNLOAD_THRESHOLD_SECONDS='"
+            << env << "', using " << seconds << "s";
+      }
+    }
+    return seconds * 1000000000LL;
+  }();
+  return threshold_ns;
+}
+
+}  // namespace
+
+std::pair<ModelReadyState, std::string>
+ModelLifeCycle::ModelInfo::ReportedState()
+{
+  if ((state_ == ModelReadyState::UNLOADING) && (unload_start_ns_ != 0)) {
+    const int64_t threshold_ns = StuckUnloadThresholdNs();
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    const int64_t stuck_ns = now_ns - static_cast<int64_t>(unload_start_ns_);
+    if ((threshold_ns > 0) && (stuck_ns >= threshold_ns)) {
+      const int64_t stuck_s = stuck_ns / 1000000000LL;
+      if (!stuck_logged_) {
+        stuck_logged_ = true;
+        LOG_WARNING << "model '" << model_path_ << "' has been UNLOADING for "
+                    << stuck_s
+                    << "s: unload is stuck (references still held); the "
+                       "version remains resident until process restart";
+      }
+      return std::make_pair(
+          state_, "stuck: unload requested " + std::to_string(stuck_s) +
+                      "s ago; references still held; resident until process "
+                      "restart");
+    }
+  }
+  return std::make_pair(state_, state_reason_);
+}
 
 const std::string&
 ModelReadyStateString(ModelReadyState state)
@@ -282,8 +340,7 @@ ModelLifeCycle::ModelStates()
 
     for (auto& version_model : model_version.second) {
       std::lock_guard<std::mutex> lock(version_model.second->mtx_);
-      version_map[version_model.first] = std::make_pair(
-          version_model.second->state_, version_model.second->state_reason_);
+      version_map[version_model.first] = version_model.second->ReportedState();
     }
 
     model_states[model_version.first] = std::move(version_map);
@@ -302,8 +359,7 @@ ModelLifeCycle::VersionStates(const ModelIdentifier& model_id)
   if (mit != map_.end()) {
     for (auto& version_model : mit->second) {
       std::lock_guard<std::mutex> lock(version_model.second->mtx_);
-      version_map[version_model.first] = std::make_pair(
-          version_model.second->state_, version_model.second->state_reason_);
+      version_map[version_model.first] = version_model.second->ReportedState();
     }
   }
 

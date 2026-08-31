@@ -26,6 +26,7 @@
 //
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -250,9 +251,21 @@ class ModelLifeCycle {
     {
       state_ = ModelReadyState::UNLOADING;
       state_reason_.clear();
+      unload_start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+      stuck_logged_ = false;
       agent_model_list_.reset();
       model_.reset();
     }
+
+    // Report (state, reason) for the index / status APIs. 'mtx_' must be
+    // held. A version UNLOADING past the stuck threshold keeps the UNLOADING
+    // state string (consumers rely on the closed state set) but its reason is
+    // replaced with a machine-checkable "stuck: ..." marker so residency
+    // checks can tell a wedged unload (leaked reference, resident until
+    // process restart) from one in progress.
+    std::pair<ModelReadyState, std::string> ReportedState();
 
     inference::ModelConfig model_config_;
     const std::string model_path_;
@@ -264,6 +277,12 @@ class ModelLifeCycle {
 
     ModelReadyState state_;
     std::string state_reason_;
+
+    // When 'state_' last became UNLOADING (steady clock, ns); 0 = never
+    // released. Used to detect and report stuck unloads.
+    uint64_t unload_start_ns_{0};
+    // Whether the stuck-unload warning was already logged for this release.
+    bool stuck_logged_{false};
 
     // flyweight
     std::shared_ptr<TritonRepoAgentModelList> agent_model_list_;
