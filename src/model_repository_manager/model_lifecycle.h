@@ -1,4 +1,4 @@
-// Copyright 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -26,6 +26,7 @@
 //
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -35,6 +36,7 @@
 #include "infer_parameter.h"
 #include "model.h"
 #include "model_config.pb.h"
+#include "model_state_report.h"
 #include "repo_agent.h"
 #include "status.h"
 #include "triton/common/model_config.h"
@@ -66,31 +68,10 @@ struct ModelLifeCycleOptions {
 };
 
 
-/// Readiness status for models.
-enum class ModelReadyState {
-  // The model is in an unknown state. The model is not available for
-  // inferencing.
-  UNKNOWN,
-
-  // The model is ready and available for inferencing.
-  READY,
-
-  // The model is unavailable, indicating that the model failed to
-  // load or has been implicitly or explicitly unloaded. The model is
-  // not available for inferencing.
-  UNAVAILABLE,
-
-  // The model is being loaded by the inference server. The model is
-  // not available for inferencing.
-  LOADING,
-
-  // The model is being unloaded by the inference server. The model is
-  // not available for inferencing.
-  UNLOADING
-};
-
-/// Get the string representation for a ModelReadyState
-const std::string& ModelReadyStateString(ModelReadyState state);
+// ModelReadyState, ModelReadyStateString, and the reported-state decision
+// (ReportedModelState + the stable reason prefixes) live in
+// model_state_report.h so they can be unit tested without this header's
+// heavier dependencies.
 
 using VersionStateMap =
     std::map<int64_t, std::pair<ModelReadyState, std::string>>;
@@ -212,6 +193,13 @@ class ModelLifeCycle {
   // Get the VersionStateMap representation of the specified model.
   const VersionStateMap VersionStates(const ModelIdentifier& model_id);
 
+  // Record that a reference to a model version was leaked by a frontend
+  // (e.g. a dropped reply hand-off): the version's unload can never
+  // complete, and the index reports it as stuck immediately instead of
+  // waiting for the stuck-unload threshold. 'model_version' must be >= 0.
+  Status ReportLeakedReference(
+      const ModelIdentifier& model_id, const int64_t model_version);
+
   // Get the state of a specific model version.
   Status ModelState(
       const ModelIdentifier& model_id, const int64_t model_version,
@@ -250,9 +238,23 @@ class ModelLifeCycle {
     {
       state_ = ModelReadyState::UNLOADING;
       state_reason_.clear();
+      unload_start_ns_ =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      stuck_logged_ = false;
+      weak_model_ = model_;
       agent_model_list_.reset();
       model_.reset();
     }
+
+    // Report (state, reason) for the index / status APIs. 'mtx_' must be
+    // held. A version UNLOADING past the stuck threshold keeps the UNLOADING
+    // state string (consumers rely on the closed state set) but its reason is
+    // replaced with a machine-checkable "stuck: ..." marker so residency
+    // checks can tell a wedged unload (leaked reference, resident until
+    // process restart) from one in progress.
+    std::pair<ModelReadyState, std::string> ReportedState();
 
     inference::ModelConfig model_config_;
     const std::string model_path_;
@@ -265,9 +267,23 @@ class ModelLifeCycle {
     ModelReadyState state_;
     std::string state_reason_;
 
+    // Number of references to this version reported leaked by a frontend
+    // (dropped reply hand-offs). Non-zero means an unload can never
+    // complete; reported as stuck in the index without waiting for the
+    // threshold.
+    uint64_t leaked_refs_{0};
+    // When 'state_' last became UNLOADING (steady clock, ns); 0 = never
+    // released. Used to detect and report stuck unloads.
+    uint64_t unload_start_ns_{0};
+    // Whether the stuck-unload warning was already logged for this release.
+    bool stuck_logged_{false};
+
     // flyweight
     std::shared_ptr<TritonRepoAgentModelList> agent_model_list_;
     std::shared_ptr<Model> model_;
+    // Observes 'model_' after Release(): use_count() > 0 while references
+    // are still held, i.e. while the unload cannot complete.
+    std::weak_ptr<Model> weak_model_;
   };
 
   struct LoadTracker {

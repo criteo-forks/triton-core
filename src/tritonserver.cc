@@ -2750,6 +2750,17 @@ TRITONSERVER_ServerModelIsReady(
 }
 
 TRITONAPI_DECLSPEC TRITONSERVER_Error*
+TRITONSERVER_ServerModelReportLeakedReference(
+    TRITONSERVER_Server* server, const char* model_name,
+    const int64_t model_version)
+{
+  tc::InferenceServer* lserver = reinterpret_cast<tc::InferenceServer*>(server);
+  RETURN_IF_STATUS_ERROR(
+      lserver->ReportModelLeakedReference(model_name, model_version));
+  return nullptr;  // Success
+}
+
+TRITONAPI_DECLSPEC TRITONSERVER_Error*
 TRITONSERVER_ServerModelBatchProperties(
     TRITONSERVER_Server* server, const char* model_name,
     const int64_t model_version, uint32_t* flags, void** voidp)

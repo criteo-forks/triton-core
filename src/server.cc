@@ -480,6 +480,19 @@ InferenceServer::IsReady(bool* ready)
 }
 
 Status
+InferenceServer::ReportModelLeakedReference(
+    const std::string& model_name, const int64_t model_version)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(Status::Code::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+  return model_repository_manager_->ReportModelLeakedReference(
+      model_name, model_version);
+}
+
+Status
 InferenceServer::ModelIsReady(const Model& model, bool* ready)
 {
   *ready = false;

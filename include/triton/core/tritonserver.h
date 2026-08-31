@@ -92,7 +92,7 @@ struct TRITONSERVER_MetricArgs;
 ///   }
 ///
 #define TRITONSERVER_API_VERSION_MAJOR 1
-#define TRITONSERVER_API_VERSION_MINOR 34
+#define TRITONSERVER_API_VERSION_MINOR 35
 
 /// Get the TRITONBACKEND API version supported by the Triton shared
 /// library. This value can be compared against the
@@ -2386,6 +2386,26 @@ TRITONSERVER_DECLSPEC struct TRITONSERVER_Error*
 TRITONSERVER_ServerModelIsReady(
     struct TRITONSERVER_Server* server, const char* model_name,
     const int64_t model_version, bool* ready);
+
+/// Report that a reference to a model version was leaked by a frontend
+/// (e.g. a reply hand-off that could not be delivered): the version's
+/// unload can never complete, and the repository index reports it as stuck
+/// immediately instead of waiting for the stuck-unload threshold.
+///
+/// Index 'reason' contract: an affected version's repository-index reason
+/// begins with the stable prefix "stuck: " once the version is UNLOADING
+/// (also used by the timeout-based stuck-unload fallback) and "warning: "
+/// while it is still READY. Residency checks may rely on these prefixes;
+/// the text after the prefix is informational and not stable.
+///
+/// \param server The inference server object.
+/// \param model_name The name of the model.
+/// \param model_version The version of the model; must be >= 0.
+/// \return a TRITONSERVER_Error indicating success or failure.
+TRITONSERVER_DECLSPEC struct TRITONSERVER_Error*
+TRITONSERVER_ServerModelReportLeakedReference(
+    struct TRITONSERVER_Server* server, const char* model_name,
+    const int64_t model_version);
 
 /// Get the batch properties of the model. The properties are
 /// communicated by a flags value and an (optional) object returned by
