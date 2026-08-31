@@ -76,13 +76,6 @@ class Scheduler {
   // Instruct the scheduler to stop processing future requests unless they are
   // considered as in-flight.
   virtual void Stop() = 0;
-
-  // Start scheduler-specific unload handling. By default this has the same
-  // semantics as Stop(): reject future work while allowing in-flight work to
-  // finish. Schedulers that can retain undispatched requests after Stop()
-  // must override this hook to drain or fail them, because those requests hold
-  // shared_ptr references that can otherwise pin the model in memory.
-  virtual void Shutdown() { Stop(); }
 };
 
 }}  // namespace triton::core

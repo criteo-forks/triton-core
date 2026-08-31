@@ -26,7 +26,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <future>
@@ -87,10 +86,7 @@ class DynamicBatchScheduler : public Scheduler {
   }
 
   // \see Scheduler::Stop()
-  void Stop() override;
-
-  // \see Scheduler::Shutdown()
-  void Shutdown() override;
+  void Stop() override { stop_ = true; }
 
  private:
   DynamicBatchScheduler(
@@ -148,28 +144,10 @@ class DynamicBatchScheduler : public Scheduler {
   // represented by this scheduler. If priority queues are not supported by the
   // scheduler, then priority zero entry is used as the single queue.
   PriorityQueue queue_;
-  // Atomic for the fast rejection check at the start of Enqueue. Dynamic
-  // enqueue rechecks it while holding mu_ at the queue ownership-transfer
-  // point; Shutdown sets it under the same mutex before enabling drain mode.
-  std::atomic<bool> stop_;
+  bool stop_;
 
   std::thread scheduler_thread_;
   std::atomic<bool> scheduler_thread_exit_;
-
-  // Set by Shutdown() (model unload): stop accepting new requests, keep
-  // dispatching until every accepted request has been served, then exit
-  // the batcher thread. 'drain_deadline_' bounds the drain so a batcher
-  // that can no longer dispatch (e.g. broken slot accounting) still
-  // terminates; requests remaining past the deadline are failed.
-  std::atomic<bool> draining_;
-  std::chrono::steady_clock::time_point drain_deadline_;
-
-  // Whether the drain deadline set by Shutdown() has expired.
-  bool DrainDeadlinePassed() const
-  {
-    return draining_.load() &&
-           (std::chrono::steady_clock::now() >= drain_deadline_);
-  }
 
   // Mutex and condvar for signaling scheduler thread
   std::mutex mu_;
