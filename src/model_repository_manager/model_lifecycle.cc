@@ -82,6 +82,21 @@ StuckUnloadThresholdNs()
 std::pair<ModelReadyState, std::string>
 ModelLifeCycle::ModelInfo::ReportedState()
 {
+  if (leaked_refs_ > 0) {
+    const std::string leaked = std::to_string(leaked_refs_);
+    if (state_ == ModelReadyState::UNLOADING) {
+      return std::make_pair(
+          state_, "stuck: " + leaked +
+                      " leaked reference(s) (dropped reply hand-offs); unload "
+                      "cannot complete; resident until process restart");
+    }
+    if (state_ == ModelReadyState::READY) {
+      return std::make_pair(
+          state_, "warning: " + leaked +
+                      " leaked reference(s) (dropped reply hand-offs); unload "
+                      "of this version will stick until process restart");
+    }
+  }
   if ((state_ == ModelReadyState::UNLOADING) && (unload_start_ns_ != 0)) {
     const int64_t threshold_ns = StuckUnloadThresholdNs();
     const int64_t now_ns =
@@ -364,6 +379,39 @@ ModelLifeCycle::VersionStates(const ModelIdentifier& model_id)
   }
 
   return version_map;
+}
+
+Status
+ModelLifeCycle::ReportLeakedReference(
+    const ModelIdentifier& model_id, const int64_t model_version)
+{
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  auto mit = map_.find(model_id);
+  if (mit == map_.end()) {
+    return Status(
+        Status::Code::NOT_FOUND, "model '" + model_id.str() + "' is not found");
+  }
+  bool marked = false;
+  for (auto& version_model : mit->second) {
+    if ((model_version >= 0) && (version_model.first != model_version)) {
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(version_model.second->mtx_);
+    ++version_model.second->leaked_refs_;
+    marked = true;
+    LOG_WARNING << "model '" << model_id.str() << "' version "
+                << version_model.first << ": leaked reference reported ("
+                << version_model.second->leaked_refs_
+                << " total); unload of this version will not complete until "
+                   "process restart";
+  }
+  if (!marked) {
+    return Status(
+        Status::Code::NOT_FOUND, "model '" + model_id.str() + "', version " +
+                                     std::to_string(model_version) +
+                                     " is not found");
+  }
+  return Status::Success;
 }
 
 Status

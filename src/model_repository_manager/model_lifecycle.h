@@ -213,6 +213,14 @@ class ModelLifeCycle {
   // Get the VersionStateMap representation of the specified model.
   const VersionStateMap VersionStates(const ModelIdentifier& model_id);
 
+  // Record that a reference to a model version was leaked by a frontend
+  // (e.g. a dropped reply hand-off): the version's unload can never
+  // complete, and the index reports it as stuck immediately instead of
+  // waiting for the stuck-unload threshold. 'model_version' < 0 marks all
+  // versions of the model.
+  Status ReportLeakedReference(
+      const ModelIdentifier& model_id, const int64_t model_version);
+
   // Get the state of a specific model version.
   Status ModelState(
       const ModelIdentifier& model_id, const int64_t model_version,
@@ -278,6 +286,11 @@ class ModelLifeCycle {
     ModelReadyState state_;
     std::string state_reason_;
 
+    // Number of references to this version reported leaked by a frontend
+    // (dropped reply hand-offs). Non-zero means an unload can never
+    // complete; reported as stuck in the index without waiting for the
+    // threshold.
+    uint64_t leaked_refs_{0};
     // When 'state_' last became UNLOADING (steady clock, ns); 0 = never
     // released. Used to detect and report stuck unloads.
     uint64_t unload_start_ns_{0};

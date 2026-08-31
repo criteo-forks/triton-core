@@ -1289,6 +1289,15 @@ ModelRepositoryManager::GetModel(
 }
 
 Status
+ModelRepositoryManager::ReportModelLeakedReference(
+    const std::string& model_name, const int64_t model_version)
+{
+  ModelIdentifier model_id("", model_name);
+  RETURN_IF_ERROR(FindModelIdentifier(model_name, &model_id));
+  return model_life_cycle_->ReportLeakedReference(model_id, model_version);
+}
+
+Status
 ModelRepositoryManager::FindModelIdentifier(
     const std::string& model_name, ModelIdentifier* model_id)
 {
