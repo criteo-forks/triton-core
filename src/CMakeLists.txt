@@ -255,7 +255,11 @@ set_target_properties(
   triton-core
   PROPERTIES
     LINK_DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libtritonserver.ldscript
-    LINK_FLAGS "-Wl,--version-script libtritonserver.ldscript"
+    # The version script exports triton::core::* only for the unit tests. Without
+    # -Bsymbolic-functions every intra-library call to an exported function turns
+    # into a call through an interposable PLT slot; the flag keeps them bound
+    # inside the library as they are when nothing is exported.
+    LINK_FLAGS "-Wl,--version-script libtritonserver.ldscript -Wl,-Bsymbolic-functions"
 )
 
 set_target_properties(
