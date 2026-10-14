@@ -484,6 +484,15 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
   // The wait_for_slots conditional can be blocking till the slots are available
   // for execution. Need to explicitly release the 'mu_' lock to allow the
   // Enqueue threads above to make progress.
+  //
+  // While blocked here, request timeouts are only enforced when the wait
+  // expires, so each wait window is clamped to the closest deadline of the
+  // pending batch (when timeout policies are in use) instead of always
+  // waiting the full 'wait_microseconds'. Without configured timeouts the
+  // behavior is unchanged. The clamp tracks the pending batch's deadlines;
+  // requests arriving during the wait are picked up when their deadline enters
+  // the pending batch on a later batching pass.
+  uint64_t clamped_wait_us = ClampWaitToClosestTimeout(wait_microseconds);
   lock->unlock();
 
   bool slot_available = false;
@@ -494,7 +503,7 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
     // consumer availability without prefetching, payload queue size otherwise.
     slot_available = rate_limiter_->PayloadSlotAvailable(
         model_, model_instance_, queue_.SupportPrefetching(),
-        false /* force_non_blocking */, wait_microseconds, stop_token,
+        false /* force_non_blocking */, clamped_wait_us, stop_token,
         CachedPayloadQueue());
     if (!slot_available && !stop_token.stop_requested()) {
       // Reject and release timeout requests from queue.
@@ -504,6 +513,7 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
         std::lock_guard<std::mutex> lock(mu_);
         queue_.RejectTimeoutRequests();
         queue_.ReleaseSkippedRequests(&rejected_requests, &cancelled_requests);
+        clamped_wait_us = ClampWaitToClosestTimeout(wait_microseconds);
       }
       FinishRejectedCancelledRequests(
           std::move(rejected_requests), std::move(cancelled_requests));
@@ -513,6 +523,18 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
   // Recapture the lock.
   lock->lock();
   return slot_available && !stop_token.stop_requested();
+}
+
+uint64_t
+DynamicBatchScheduler::ClampWaitToClosestTimeout(uint64_t wait_microseconds)
+{
+  // 'mu_' mutex must be held when this function is called.
+  const uint64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  return ClampWaitToDeadline(
+      wait_microseconds, queue_.ClosestTimeout(), now_ns);
 }
 
 uint64_t
