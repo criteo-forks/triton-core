@@ -31,8 +31,7 @@
 namespace triton { namespace core {
 
 InstanceQueue::InstanceQueue(size_t max_batch_size, uint64_t max_queue_delay_ns)
-    : max_batch_size_(max_batch_size), max_queue_delay_ns_(max_queue_delay_ns),
-      waiting_consumer_count_(0), closed_(false)
+    : max_batch_size_(max_batch_size), max_queue_delay_ns_(max_queue_delay_ns)
 {
 }
 
@@ -122,30 +121,35 @@ InstanceQueue::Dequeue(
 void
 InstanceQueue::IncrementConsumerCount()
 {
-  {
+  waiting_consumer_count_.fetch_add(1);
+  // Only engage the mutex and CV when a WaitForConsumer() caller is registered.
+  // The seq_cst ordering of the increment above and the registration in
+  // WaitForConsumer() guarantees that either this load sees the waiter or the
+  // waiter's predicate check sees the incremented count.
+  if (consumer_waiters_.load() > 0) {
     std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-    waiting_consumer_count_++;
+    waiting_consumer_cv_.notify_one();
   }
-  waiting_consumer_cv_.notify_one();
 }
 
 void
 InstanceQueue::DecrementConsumerCount()
 {
-  {
-    std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-    waiting_consumer_count_--;
-  }
-  waiting_consumer_cv_.notify_one();
+  // A decrement can never satisfy the 'count > 0' wait predicate, so no
+  // notification is needed here.
+  waiting_consumer_count_.fetch_sub(1);
 }
 
 bool
 InstanceQueue::WaitForConsumer()
 {
   std::unique_lock<std::mutex> lock(waiting_consumer_mu_);
-  waiting_consumer_cv_.wait(
-      lock, [this]() { return closed_ || (waiting_consumer_count_ > 0); });
-  return !closed_;
+  consumer_waiters_.fetch_add(1);
+  waiting_consumer_cv_.wait(lock, [this]() {
+    return closed_.load() || (waiting_consumer_count_.load() > 0);
+  });
+  consumer_waiters_.fetch_sub(1);
+  return !closed_.load();
 }
 
 void
@@ -153,7 +157,7 @@ InstanceQueue::Close()
 {
   {
     std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-    closed_ = true;
+    closed_.store(true);
   }
   waiting_consumer_cv_.notify_all();
 }
@@ -168,19 +172,20 @@ InstanceQueue::WaitForConsumer(
     waiting_consumer_cv_.notify_all();
   });
   std::unique_lock<std::mutex> lock(waiting_consumer_mu_);
+  consumer_waiters_.fetch_add(1);
   const bool ready =
       waiting_consumer_cv_.wait_for(lock, timeout, [this, stop_token]() {
-        return closed_ || (waiting_consumer_count_ > 0) ||
+        return closed_.load() || (waiting_consumer_count_.load() > 0) ||
                stop_token.stop_requested();
       });
-  return ready && !closed_ && !stop_token.stop_requested();
+  consumer_waiters_.fetch_sub(1);
+  return ready && !closed_.load() && !stop_token.stop_requested();
 }
 
 int
 InstanceQueue::WaitingConsumerCount()
 {
-  std::lock_guard<std::mutex> lock(waiting_consumer_mu_);
-  return closed_ ? 0 : waiting_consumer_count_;
+  return closed_.load() ? 0 : waiting_consumer_count_.load();
 }
 
 }}  // namespace triton::core
