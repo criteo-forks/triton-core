@@ -114,15 +114,15 @@ class DynamicBatchScheduler : public Scheduler {
   // when waiting for payload slot and re-acquired before this function returns.
   // For queued requests under policy REJECT, they will be rejected if timed-out
   // while waiting for a slot. The timeout will be checked every
-  // 'wait_microseconds', or sooner when the pending batch holds a closer
-  // request deadline. The 'wait_microseconds' should be non-zero.
+  // 'wait_microseconds', or sooner when a queued request has a closer
+  // deadline. The 'wait_microseconds' should be non-zero.
   // Returns false if the scheduler is exiting before a slot is available.
   bool WaitForPayloadSlotAvailable(
       std::unique_lock<std::mutex>* lock, uint64_t wait_microseconds);
 
   // Returns 'wait_microseconds' clamped to the time remaining until the
-  // closest request deadline in the pending batch (1 ms floor), or unchanged
-  // when no timeout policy is in effect. 'mu_' must be held.
+  // closest rejecting deadline among the queued requests (1 ms floor), or
+  // unchanged when none is in effect. 'mu_' must be held.
   uint64_t ClampWaitToClosestTimeout(uint64_t wait_microseconds);
 
   // Custom batching function calls
