@@ -365,7 +365,10 @@ class InferenceRequest {
   // be reused for a new inference, rebinding it to 'model' /
   // 'requested_model_version' exactly as if it had been constructed with
   // them (the model must be re-resolved by the caller so a reload or
-  // unload between reuses is honored). Only allowed when the request is
+  // unload between reuses is honored). A null 'model' leaves the request
+  // bound to no model, and drops the response factory's reference to it, for
+  // a request that waits for reuse; it must be reset again with a model
+  // before it is used. Only allowed when the request is
   // in RELEASED, FAILED_ENQUEUE or INITIALIZED state. The caller must
   // re-set release/response callbacks and all inputs afterwards; those
   // callbacks and the response allocator are not cleared here. The response

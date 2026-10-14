@@ -1332,7 +1332,11 @@ TRITONSERVER_InferenceRequestRemoveAllInputs(
 ///
 /// \param inference_request The request object.
 /// \param server The inference server object.
-/// \param model_name The name of the model to use for the next inference.
+/// \param model_name The name of the model to use for the next inference. If
+/// NULL the request is reset without being bound to a model ('server' is then
+/// not used): it keeps no reference to any model, so a request that waits for
+/// reuse does not keep a model loaded, and it must be reset again with a model
+/// name before it is used.
 /// \param model_version The version of the model to use for the next
 /// inference. If -1 then the server will choose a version based on the
 /// model's policy.

@@ -187,4 +187,55 @@ TEST(RequestReuseTest, CancelledFactoryCleared)
   EXPECT_FALSE(request.IsCancelled());
 }
 
+// A request reset without a model, as it is while it waits for reuse, must not
+// keep the model loaded: neither itself nor through its response factory.
+TEST(RequestReuseTest, ResetWithoutModelDropsModelReferences)
+{
+  auto model = MakeTestModel();
+  InferenceRequest request(model, 1);
+  ASSERT_TRUE(
+      request.SetResponseCallback(nullptr, nullptr, nullptr, nullptr).IsOk());
+  request.SetResponseFactory();
+  ASSERT_TRUE(request.SetState(InferenceRequest::State::RELEASED).IsOk());
+  ASSERT_EQ(model.use_count(), 3);  // test, request, response factory
+
+  ASSERT_TRUE(request.Reset(nullptr, -1).IsOk());
+
+  EXPECT_EQ(model.use_count(), 1);
+}
+
+// A response factory that escaped (a backend holds it) keeps working for its
+// other owners: the request only gives up its own reference.
+TEST(RequestReuseTest, ResetWithoutModelLeavesSharedFactoryToItsOwners)
+{
+  auto model = MakeTestModel();
+  InferenceRequest request(model, 1);
+  ASSERT_TRUE(
+      request.SetResponseCallback(nullptr, nullptr, nullptr, nullptr).IsOk());
+  request.SetResponseFactory();
+  std::shared_ptr<InferenceResponseFactory> held = request.ResponseFactory();
+  ASSERT_TRUE(request.SetState(InferenceRequest::State::RELEASED).IsOk());
+
+  ASSERT_TRUE(request.Reset(nullptr, -1).IsOk());
+
+  EXPECT_EQ(request.ResponseFactory(), nullptr);
+  EXPECT_EQ(held.use_count(), 1);
+  EXPECT_EQ(model.use_count(), 2);  // test, the factory that escaped
+}
+
+// An unbound request is bound again by the next Reset() with a model.
+TEST(RequestReuseTest, ResetBindsAgainAfterUnbind)
+{
+  auto model = MakeTestModel();
+  InferenceRequest request(model, 1);
+  ASSERT_TRUE(request.SetState(InferenceRequest::State::RELEASED).IsOk());
+  ASSERT_TRUE(request.Reset(nullptr, -1).IsOk());
+
+  ASSERT_TRUE(request.Reset(model, 3).IsOk());
+
+  EXPECT_EQ(request.RequestedModelVersion(), 3);
+  EXPECT_EQ(request.Priority(), 0u);
+  EXPECT_EQ(model.use_count(), 2);  // test, request
+}
+
 }}}  // namespace triton::core

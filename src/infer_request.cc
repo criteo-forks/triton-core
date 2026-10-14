@@ -909,7 +909,9 @@ InferenceRequest::Reset(
 
   // Rebind to the (re-resolved) model before resetting the fields below:
   // the model may have been reloaded since the previous inference, and
-  // SetPriority() normalizes against the model configuration.
+  // SetPriority() normalizes against the model configuration. A null 'model'
+  // unbinds the request instead, so that a request kept for later reuse does
+  // not keep a model loaded.
   model_shared_ = model;
   model_raw_ = model.get();
   requested_model_version_ = requested_model_version;
@@ -919,7 +921,11 @@ InferenceRequest::Reset(
   correlation_id_ = uint64_t(0);
   batch_size_ = 0;
   timeout_us_ = 0;
-  SetPriority(0);
+  if (model_raw_ != nullptr) {
+    SetPriority(0);
+  } else {
+    priority_ = 0;
+  }
 
   cache_key_.clear();
   cache_key_is_set_ = false;
@@ -962,6 +968,17 @@ InferenceRequest::Reset(
 #endif  // TRITON_ENABLE_TRACING
 
   needs_normalization_ = true;
+
+  if (model == nullptr && response_factory_ != nullptr) {
+    // The response factory references the model of the previous inference.
+    // Drop that reference too, or release the factory when it is shared: its
+    // other owners keep it alive for as long as they need it.
+    if (response_factory_.use_count() == 1) {
+      response_factory_->ReleaseModel();
+    } else {
+      response_factory_.reset();
+    }
+  }
 
   return Status::Success;
 }

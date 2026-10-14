@@ -2038,12 +2038,17 @@ TRITONSERVER_InferenceRequestReset(
 {
   tc::InferenceRequest* lrequest =
       reinterpret_cast<tc::InferenceRequest*>(inference_request);
-  tc::InferenceServer* lserver = reinterpret_cast<tc::InferenceServer*>(server);
 
   // Re-resolve the model exactly like TRITONSERVER_InferenceRequestNew so a
-  // reload/unload since the previous inference is honored.
+  // reload/unload since the previous inference is honored. Without a model
+  // name the request is only unbound from its model.
   std::shared_ptr<tc::Model> model;
-  RETURN_IF_STATUS_ERROR(lserver->GetModel(model_name, model_version, &model));
+  if (model_name != nullptr) {
+    tc::InferenceServer* lserver =
+        reinterpret_cast<tc::InferenceServer*>(server);
+    RETURN_IF_STATUS_ERROR(
+        lserver->GetModel(model_name, model_version, &model));
+  }
 
   RETURN_IF_STATUS_ERROR(lrequest->Reset(model, model_version));
   return nullptr;  // Success

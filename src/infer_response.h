@@ -118,6 +118,10 @@ class InferenceResponseFactory {
 #endif  // TRITON_ENABLE_TRACING
   }
 
+  // Drops the reference to the model. Only valid while nothing else references
+  // the factory.
+  void ReleaseModel() { model_ = nullptr; }
+
   void Cancel() { is_cancelled_ = true; }
 
   bool IsCancelled() { return is_cancelled_; }
