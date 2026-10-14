@@ -340,18 +340,24 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     wake_batcher |= start_consumer_wait;
 
     if (wake_batcher) {
-      // Closes a lost-wakeup race against BatcherThread's use of
-      // 'batcher_idle_': if the batcher is (or is about to be) parked in
-      // cv_.wait_for(), this empty critical section serializes with that
-      // transition so the notify below cannot run ahead of the wait.
-      if (batcher_idle_.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(mu_);
-      }
-      cv_.notify_one();
+      NotifyBatcher();
     }
   }
 
   return Status::Success;
+}
+
+void
+DynamicBatchScheduler::NotifyBatcher()
+{
+  // Closes a lost-wakeup race against BatcherThread's use of 'batcher_idle_':
+  // if the batcher is (or is about to be) parked in cv_.wait_for(), this empty
+  // critical section serializes with that transition so the notify below
+  // cannot run ahead of the wait.
+  if (batcher_idle_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(mu_);
+  }
+  cv_.notify_one();
 }
 
 void
@@ -547,7 +553,7 @@ DynamicBatchScheduler::BatcherThread(const int nice)
       std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
       payload_ready = (curr_payload_->GetState() == Payload::State::READY);
       if (payload_ready) {
-        auto callback = [this]() { cv_.notify_one(); };
+        auto callback = [this]() { NotifyBatcher(); };
         curr_payload_->SetCallback(callback);
         CustomBatchFini();
       }
