@@ -52,6 +52,7 @@ void
 InstanceQueue::Enqueue(const std::shared_ptr<Payload>& payload)
 {
   payload_queue_.push_back(payload);
+  size_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void
@@ -62,6 +63,7 @@ InstanceQueue::Dequeue(
   // Dequeue frontmost payload and mark it for execution.
   *payload = payload_queue_.front();
   payload_queue_.pop_front();
+  size_.fetch_sub(1, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> exec_lock(*((*payload)->GetExecMutex()));
     (*payload)->SetState(Payload::State::EXECUTING);
@@ -94,6 +96,7 @@ InstanceQueue::Dequeue(
             if (status.IsOk()) {
               merged_payloads->push_back(payload_queue_.front());
               payload_queue_.pop_front();
+              size_.fetch_sub(1, std::memory_order_relaxed);
               continue_merge = true;
             }
           }

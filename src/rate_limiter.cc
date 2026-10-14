@@ -126,6 +126,7 @@ RateLimiter::UnregisterModelInstance(TritonModelInstance* triton_model_instance)
       if (s_it != queues.end()) {
         s_it->second->Close();
         queues.erase(s_it);
+        p_it->second->instance_count_.fetch_sub(1, std::memory_order_relaxed);
       }
     }
   }
@@ -241,12 +242,15 @@ RateLimiter::PayloadSlotAvailable(
     // The logic below sets cap on the number of payloads that
     // can be pre-fetched. For per-model batcher the cap is
     // twice the number of model instances. For per-instance
-    // batcher the cap is 2.
+    // batcher the cap is 2. The cap is advisory, so the non-blocking probe
+    // reads the queue depth and the instance count without taking 'mu_'; it
+    // runs on every request enqueue and on every batcher wake.
     auto slot_available = [payload_queue, model_instance]() {
-      size_t multiplier = (model_instance == nullptr)
-                              ? payload_queue->specific_queues_.size()
-                              : 1;
-      return payload_queue->queue_->Size() < (2 * multiplier);
+      size_t multiplier =
+          (model_instance == nullptr)
+              ? payload_queue->instance_count_.load(std::memory_order_relaxed)
+              : 1;
+      return payload_queue->queue_->SizeApprox() < (2 * multiplier);
     };
     if (!force_non_blocking && (wait_microseconds != 0)) {
       std::stop_callback on_stop(stop_token, [payload_queue]() {
@@ -259,7 +263,6 @@ RateLimiter::PayloadSlotAvailable(
           [&]() { return slot_available() || stop_token.stop_requested(); });
       result &= !stop_token.stop_requested();
     } else {
-      std::lock_guard<std::mutex> lk(payload_queue->mu_);
       result = slot_available();
     }
   } else {
@@ -536,6 +539,7 @@ RateLimiter::InitializePayloadQueues(const TritonModelInstance* instance)
           instance,
           std::make_shared<InstanceQueue>(
               config.max_batch_size(), max_queue_delay_microseconds * 1000));
+      payload_queue->instance_count_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
