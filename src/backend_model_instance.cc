@@ -811,16 +811,23 @@ TritonModelInstance::TritonBackendThread::BackendThread()
                  << " at default nice on device " << device_id_ << "...";
 #endif
 
+  const auto rate_limiter = model_->Server()->GetRateLimiter();
+  // Cache the payload queue handle to avoid the global queue-map lookup on
+  // every dequeue; it stays valid for the lifetime of this thread. Resolved
+  // lazily as the queue is registered concurrently with thread startup.
+  RateLimiter::PayloadQueue* payload_queue = nullptr;
   bool should_exit = false;
   while (!should_exit) {
+    if (payload_queue == nullptr) {
+      payload_queue = rate_limiter->LookupPayloadQueue(model_);
+    }
     std::shared_ptr<Payload> payload;
-    model_->Server()->GetRateLimiter()->DequeuePayload(
-        model_instances_, &payload);
+    rate_limiter->DequeuePayload(model_instances_, &payload, payload_queue);
     NVTX_RANGE(nvtx_, "BackendThread " + name_);
     payload->Execute(&should_exit);
     model_instances_.push_back(payload->GetInstance());
     // Release the payload to the RateLimiter
-    model_->Server()->GetRateLimiter()->PayloadRelease(payload);
+    rate_limiter->PayloadRelease(payload);
   }
   LOG_VERBOSE(1) << "Stopping backend thread for " << name_ << "...";
 }
