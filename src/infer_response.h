@@ -1,4 +1,4 @@
-// Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -75,6 +75,47 @@ class InferenceResponseFactory {
                           std::chrono::steady_clock::now().time_since_epoch())
                           .count();
 #endif  // TRITON_ENABLE_METRICS
+  }
+
+  // Reinitialize this factory with the arguments of the constructor, so that
+  // an instance whose owning request is being reused does not need to be
+  // reallocated. Mirrors the constructor field-for-field. Only valid while
+  // nothing else references the factory.
+  void Reinitialize(
+      const std::shared_ptr<Model>& model, const std::string& id,
+      const ResponseAllocator* allocator, void* alloc_userp,
+      TRITONSERVER_InferenceResponseCompleteFn_t response_fn,
+      void* response_userp,
+      const std::function<void(
+          std::unique_ptr<InferenceResponse>&&, const uint32_t)>& delegator)
+  {
+    model_ = model;
+    id_ = id;
+    allocator_ = allocator;
+    alloc_userp_ = alloc_userp;
+    response_fn_ = response_fn;
+    response_userp_ = response_userp;
+    response_delegator_ = delegator;
+    is_cancelled_ = false;
+#ifdef TRITON_ENABLE_METRICS
+    // A response created through the previous use may still be alive and holds
+    // its own reference to 'responses_sent_'; reusing that counter would
+    // corrupt the statistics of the response, so allocate a fresh one then.
+    if (responses_sent_ && (responses_sent_.use_count() == 1)) {
+      responses_sent_->store(0);
+    } else {
+      responses_sent_ = std::make_shared<std::atomic<uint64_t>>(0);
+    }
+    infer_start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+#endif  // TRITON_ENABLE_METRICS
+#ifdef TRITON_ENABLE_STATS
+    response_stats_index_ = 0;
+#endif  // TRITON_ENABLE_STATS
+#ifdef TRITON_ENABLE_TRACING
+    trace_ = nullptr;
+#endif  // TRITON_ENABLE_TRACING
   }
 
   void Cancel() { is_cancelled_ = true; }

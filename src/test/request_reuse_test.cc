@@ -124,4 +124,67 @@ TEST(RequestReuseTest, ResetWrongStateFails)
   EXPECT_FALSE(request.Reset(model, 1).IsOk());
 }
 
+// When the request is the sole owner of its response factory,
+// SetResponseFactory() must reinitialize the existing object in place instead
+// of allocating a new one. A weak reference tells the two apart reliably: an
+// address comparison would also pass if the old factory was freed and the new
+// one happened to be allocated at the same address.
+TEST(RequestReuseTest, FactoryReuseWhenSoleOwner)
+{
+  auto model = MakeTestModel();
+  InferenceRequest request(model, 1);
+  ASSERT_TRUE(
+      request.SetResponseCallback(nullptr, nullptr, nullptr, nullptr).IsOk());
+
+  request.SetResponseFactory();
+  std::weak_ptr<InferenceResponseFactory> first = request.ResponseFactory();
+
+  request.SetResponseFactory();
+
+  ASSERT_FALSE(first.expired());
+  EXPECT_EQ(first.lock(), request.ResponseFactory());
+}
+
+// When another owner (e.g. a backend holding the factory via
+// TRITONBACKEND_ResponseFactoryNew) still references the current response
+// factory, SetResponseFactory() must allocate a new object and leave the
+// shared one untouched.
+TEST(RequestReuseTest, FactoryFreshWhenShared)
+{
+  auto model = MakeTestModel();
+  InferenceRequest request(model, 1);
+  ASSERT_TRUE(
+      request.SetResponseCallback(nullptr, nullptr, nullptr, nullptr).IsOk());
+
+  request.SetResponseFactory();
+  std::shared_ptr<InferenceResponseFactory> held = request.ResponseFactory();
+  held->Cancel();
+
+  request.SetResponseFactory();
+
+  EXPECT_NE(held, request.ResponseFactory());
+  // The still-referenced factory must not have been reinitialized as a side
+  // effect of creating the new one.
+  EXPECT_TRUE(held->IsCancelled());
+  EXPECT_FALSE(request.IsCancelled());
+}
+
+// A cancellation on the response factory must not survive into the factory
+// object reused for the next inference.
+TEST(RequestReuseTest, CancelledFactoryCleared)
+{
+  auto model = MakeTestModel();
+  InferenceRequest request(model, 1);
+  ASSERT_TRUE(
+      request.SetResponseCallback(nullptr, nullptr, nullptr, nullptr).IsOk());
+
+  request.SetResponseFactory();
+  ASSERT_TRUE(request.Cancel().IsOk());
+  EXPECT_TRUE(request.IsCancelled());
+
+  // Sole owner here, so this reinitializes the same factory object in place.
+  request.SetResponseFactory();
+  EXPECT_FALSE(request.IsCancelled());
+}
+
 }}}  // namespace triton::core

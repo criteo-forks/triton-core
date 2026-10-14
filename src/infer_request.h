@@ -370,8 +370,8 @@ class InferenceRequest {
   // re-set release/response callbacks and all inputs afterwards; those
   // callbacks and the response allocator are not cleared here. The response
   // factory (including its cancellation flag) is not touched; the next
-  // PrepareForInference() replaces it. Not synchronized: no other thread may
-  // use the request (for example to cancel it) while or after it is reset
+  // PrepareForInference() reinitializes it. Not synchronized: no other thread
+  // may use the request (for example to cancel it) while or after it is reset
   // for the previous inference.
   Status Reset(
       const std::shared_ptr<Model>& model,
@@ -590,9 +590,19 @@ class InferenceRequest {
 
   void SetResponseFactory()
   {
-    response_factory_.reset(new InferenceResponseFactory(
-        model_shared_, id_, response_allocator_, alloc_userp_,
-        response_callback_, response_userp_, response_delegator_));
+    if (response_factory_ && (response_factory_.use_count() == 1)) {
+      // Sole owner: reinitialize in place to avoid reallocation.
+      response_factory_->Reinitialize(
+          model_shared_, id_, response_allocator_, alloc_userp_,
+          response_callback_, response_userp_, response_delegator_);
+    } else {
+      // The factory may have escaped via TRITONBACKEND_ResponseFactoryNew, in
+      // which case reinitializing it in place would corrupt the object still
+      // referenced elsewhere, so a fresh one must be created here instead.
+      response_factory_ = std::make_shared<InferenceResponseFactory>(
+          model_shared_, id_, response_allocator_, alloc_userp_,
+          response_callback_, response_userp_, response_delegator_);
+    }
   }
 
   const std::shared_ptr<SequenceStates>& GetSequenceStates() const
