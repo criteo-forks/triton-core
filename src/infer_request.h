@@ -361,6 +361,22 @@ class InferenceRequest {
   // Define and validate state transitions for request.
   Status SetState(InferenceRequest::State state);
 
+  // Reset the request to a freshly-constructed state so the object can
+  // be reused for a new inference, rebinding it to 'model' /
+  // 'requested_model_version' exactly as if it had been constructed with
+  // them (the model must be re-resolved by the caller so a reload or
+  // unload between reuses is honored). Only allowed when the request is
+  // in RELEASED, FAILED_ENQUEUE or INITIALIZED state. The caller must
+  // re-set release/response callbacks and all inputs afterwards; those
+  // callbacks and the response allocator are not cleared here. The response
+  // factory (including its cancellation flag) is not touched; the next
+  // PrepareForInference() replaces it. Not synchronized: no other thread may
+  // use the request (for example to cancel it) while or after it is reset
+  // for the previous inference.
+  Status Reset(
+      const std::shared_ptr<Model>& model,
+      const int64_t requested_model_version);
+
 #ifdef TRITON_ENABLE_TRACING
   const std::shared_ptr<InferenceTraceProxy>& TraceProxy() const
   {
