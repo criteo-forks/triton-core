@@ -1,4 +1,4 @@
-# Copyright 2019-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -29,5 +29,11 @@
     TRITONBACKEND_*;
     TRITONREPOAGENT_*;
     TRITONCACHE_*;
+    # Internal C++ symbols exported so the unit tests under src/test/ can link
+    # against the shared library (they exercise scheduler/payload internals that
+    # are not part of the C API). Not a stable interface.
+    extern "C++" {
+      triton::core::*;
+    };
   local: *;
 };
