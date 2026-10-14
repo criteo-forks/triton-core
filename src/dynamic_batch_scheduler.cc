@@ -253,6 +253,7 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 
   } else {
     bool wake_batcher = true;
+    bool start_consumer_wait = false;
     {
       std::lock_guard<std::mutex> lock(mu_);
 
@@ -264,31 +265,41 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
       RETURN_IF_ERROR(queue_.Enqueue(request->Priority(), request));
       queued_batch_size_ += batch_size;
 
-      // If there are any idle runners and the queued batch size is greater or
-      // equal to next preferred batch size, then wake batcher up to service
-      // this request. We do the actual wake outside of the lock to avoid
-      // having the woken thread immediately block on the lock
-      // Explicitly force non-blocking to prevent waiting for the slot to
-      // be available.
-      wake_batcher = model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
-          model_, model_instance_, queue_.SupportPrefetching(),
-          true /*force_non_blocking*/, 0 /*wait_microseconds*/,
-          {} /*stop_token*/, CachedPayloadQueue());
-
       // We may wake up runner less often if we don't enforce equal shape
       // within a batch, otherwise must always wake up runner to check it
       if (enforce_equal_shape_tensors_.empty()) {
         std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
         auto payload_state = curr_payload_->GetState();
-        wake_batcher &=
+        wake_batcher =
             (payload_saturated_ || IsStaleState(payload_state) ||
              (queued_batch_size_ >= next_preferred_batch_size_));
       }
 
       // Start the consumer wait even if the first queued request arrives while
       // all backends are busy. Consumer notifications target the rate limiter.
-      wake_batcher |= queue_was_empty && !queue_.SupportPrefetching();
+      start_consumer_wait = queue_was_empty && !queue_.SupportPrefetching();
     }
+
+    // If there are any idle runners and the queued batch size is greater or
+    // equal to next preferred batch size, then wake batcher up to service
+    // this request. We do the actual wake outside of the lock to avoid
+    // having the woken thread immediately block on the lock.
+    // Explicitly force non-blocking to prevent waiting for the slot to
+    // be available.
+    //
+    // The slot probe is evaluated after releasing 'mu_' on purpose: it
+    // acquires rate-limiter internal locks that are contended by the runner
+    // threads, and holding 'mu_' across it would couple frontend enqueues to
+    // runner-side contention. The wake decision is advisory: a stale answer
+    // at worst delays the batcher wake until the next enqueue or its wait
+    // timeout.
+    if (wake_batcher) {
+      wake_batcher = model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
+          model_, model_instance_, queue_.SupportPrefetching(),
+          true /*force_non_blocking*/, 0 /*wait_microseconds*/,
+          {} /*stop_token*/, CachedPayloadQueue());
+    }
+    wake_batcher |= start_consumer_wait;
 
     if (wake_batcher) {
       cv_.notify_one();
