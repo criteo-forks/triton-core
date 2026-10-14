@@ -1,4 +1,4 @@
-// Copyright 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <stop_token>
 
@@ -43,6 +44,9 @@ class InstanceQueue {
 
   size_t Size();
   bool Empty();
+  // Lock-free approximate size for advisory checks (e.g. the payload
+  // prefetch cap); may lag concurrent enqueues/dequeues.
+  size_t SizeApprox() const { return size_.load(std::memory_order_relaxed); }
   void Enqueue(const std::shared_ptr<Payload>& payload);
   void Dequeue(
       std::shared_ptr<Payload>* payload,
@@ -65,6 +69,9 @@ class InstanceQueue {
   std::deque<std::shared_ptr<Payload>> payload_queue_;
   std::shared_ptr<Payload> staged_payload_;
   std::mutex mu_;
+  // Mirrors payload_queue_.size(). Writers hold the owning
+  // RateLimiter::PayloadQueue::mu_; SizeApprox() reads it without the lock.
+  std::atomic<size_t> size_{0};
 
   int waiting_consumer_count_;
   bool closed_;
