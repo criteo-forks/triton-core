@@ -76,6 +76,23 @@ FinishRejectedCancelledRequests(
       std::move(cancelled_requests), cancelled_status, FailureReason::CANCELED);
 }
 
+namespace {
+
+// 'queued_batch_size_' is an advisory counter (it feeds the batcher wake
+// predicate). A queue-corruption error path resets it to zero while staged
+// requests it already counted may still flow into the queue, so a plain
+// fetch_sub could wrap it around to a huge value; clamp at zero instead.
+void
+ClampedDecrement(std::atomic<size_t>& counter, const size_t count)
+{
+  size_t cur = counter.load(std::memory_order_relaxed);
+  while (!counter.compare_exchange_weak(
+      cur, cur - std::min(cur, count), std::memory_order_relaxed)) {
+  }
+}
+
+}  // namespace
+
 DynamicBatchScheduler::DynamicBatchScheduler(
     TritonModel* model, TritonModelInstance* model_instance,
     const bool dynamic_batching_enabled, const int32_t max_batch_size,
@@ -89,7 +106,8 @@ DynamicBatchScheduler::DynamicBatchScheduler(
       model_name_(model->Name()),
       dynamic_batching_enabled_(dynamic_batching_enabled),
       queue_(default_queue_policy, priority_levels, queue_policy_map),
-      stop_(false), max_batch_size_((size_t)std::max(1, max_batch_size)),
+      stop_(false), use_staging_(queue_.SupportPrefetching()),
+      max_batch_size_((size_t)std::max(1, max_batch_size)),
       preferred_batch_sizes_(preferred_batch_sizes),
       pending_batch_delay_ns_(max_queue_delay_microseconds * 1000),
       pending_batch_size_(0), queued_batch_size_(0),
@@ -254,7 +272,27 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
   } else {
     bool wake_batcher = true;
     bool start_consumer_wait = false;
-    {
+    if (use_staging_) {
+      // Hand the request off to the batcher thread through 'staging_' instead
+      // of enqueuing into 'queue_' under 'mu_': the batcher holds 'mu_' for
+      // its whole batch-formation pass (a cursor walk over the queued
+      // requests) and every frontend thread would convoy behind it. Admission
+      // cannot fail here, see 'use_staging_'.
+      queued_batch_size_.fetch_add(
+          std::max(1U, request->BatchSize()), std::memory_order_relaxed);
+      staging_.Push(std::move(request));
+
+      // We may wake up runner less often if we don't enforce equal shape
+      // within a batch, otherwise must always wake up runner to check it. The
+      // decision only reads atomics: a stale answer at worst delays the wake
+      // until the next enqueue or the batcher's wait timeout.
+      if (enforce_equal_shape_tensors_.empty()) {
+        wake_batcher =
+            (payload_saturated_.load(std::memory_order_relaxed) ||
+             (queued_batch_size_.load(std::memory_order_relaxed) >=
+              next_preferred_batch_size_.load(std::memory_order_relaxed)));
+      }
+    } else {
       std::lock_guard<std::mutex> lock(mu_);
 
       const bool queue_was_empty = queue_.Empty();
@@ -287,7 +325,7 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     // Explicitly force non-blocking to prevent waiting for the slot to
     // be available.
     //
-    // The slot probe is evaluated after releasing 'mu_' on purpose: it
+    // The slot probe is evaluated without holding 'mu_' on purpose: it
     // acquires rate-limiter internal locks that are contended by the runner
     // threads, and holding 'mu_' across it would couple frontend enqueues to
     // runner-side contention. The wake decision is advisory: a stale answer
@@ -302,6 +340,13 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     wake_batcher |= start_consumer_wait;
 
     if (wake_batcher) {
+      // Closes a lost-wakeup race against BatcherThread's use of
+      // 'batcher_idle_': if the batcher is (or is about to be) parked in
+      // cv_.wait_for(), this empty critical section serializes with that
+      // transition so the notify below cannot run ahead of the wait.
+      if (batcher_idle_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(mu_);
+      }
       cv_.notify_one();
     }
   }
@@ -314,8 +359,25 @@ DynamicBatchScheduler::NewPayload()
 {
   curr_payload_ = model_->Server()->GetRateLimiter()->GetPayload(
       Payload::Operation::INFER_RUN, model_instance_);
-  payload_saturated_ = false;
+  payload_saturated_.store(false, std::memory_order_relaxed);
   CustomBatchInit();
+}
+
+void
+DynamicBatchScheduler::DrainStagingToQueue()
+{
+  // 'mu_' mutex must be held when this function is called.
+  for (auto& request : staging_.TakeAll()) {
+    const size_t batch_size = std::max(1U, request->BatchSize());
+    auto status = queue_.Enqueue(request->Priority(), request);
+    if (!status.IsOk()) {
+      // Unreachable while 'use_staging_' holds (no queue policy to reject
+      // against); a request must still never be dropped without a response.
+      ClampedDecrement(queued_batch_size_, batch_size);
+      InferenceRequest::RespondIfError(
+          request, status, true /* release_requests */);
+    }
+  }
 }
 
 void
@@ -358,17 +420,24 @@ DynamicBatchScheduler::BatcherThread(const int nice)
     // Hold the lock for as short a time as possible.
     {
       std::unique_lock<std::mutex> lock(mu_);
+
+      // Drain 'staging_' first thing, so every check below that looks at
+      // 'queue_' sees the requests handed off since the previous iteration.
+      if (use_staging_) {
+        DrainStagingToQueue();
+      }
+
       bool need_new_payload = false;
       {
         std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
-        need_new_payload =
-            payload_saturated_ || IsStaleState(curr_payload_->GetState());
+        need_new_payload = payload_saturated_.load(std::memory_order_relaxed) ||
+                           IsStaleState(curr_payload_->GetState());
       }
       // NewPayload() may release the last reference to the current payload and
       // destroy its exec mutex, so it must not run while 'exec_lock' holds it.
       if (need_new_payload) {
         NewPayload();
-        next_preferred_batch_size_ = 0;
+        next_preferred_batch_size_.store(0, std::memory_order_relaxed);
       }
 
       if (delay_cnt > 0) {
@@ -384,7 +453,7 @@ DynamicBatchScheduler::BatcherThread(const int nice)
       } else if (queue_.Empty()) {
         wait_microseconds = default_wait_microseconds;
       } else {
-        if (payload_saturated_) {
+        if (payload_saturated_.load(std::memory_order_relaxed)) {
           continue;
         }
 
@@ -429,7 +498,7 @@ DynamicBatchScheduler::BatcherThread(const int nice)
                           << "Failed to retrieve request from scheduler queue: "
                           << status.Message();
                 queue_.ResetCursor();
-                queued_batch_size_ = 0;
+                queued_batch_size_.store(0, std::memory_order_relaxed);
                 pending_batch_size_ = 0;
                 break;
               }
@@ -439,7 +508,7 @@ DynamicBatchScheduler::BatcherThread(const int nice)
               curr_payload_->SetState(Payload::State::READY);
             }
 
-            queued_batch_size_ -= pending_batch_size_;
+            ClampedDecrement(queued_batch_size_, pending_batch_size_);
             pending_batch_size_ = 0;
           }
         }
@@ -449,7 +518,20 @@ DynamicBatchScheduler::BatcherThread(const int nice)
       // for the specified timeout before checking the queue again.
       if ((wait_microseconds > 0) && !scheduler_thread_stop_.stop_requested()) {
         std::chrono::microseconds wait_timeout(wait_microseconds);
-        cv_.wait_for(lock, wait_timeout);
+        // Set while still holding 'mu_', immediately before the wait releases
+        // it, and cleared right after waking (see 'batcher_idle_').
+        batcher_idle_.store(true, std::memory_order_release);
+        // Exact (mutex-taking) staging emptiness check: a producer may have
+        // pushed after the drain at the top of this iteration, with its notify
+        // landing before this thread parks. If its Push() completed before
+        // this check we see the request and skip the wait; otherwise the
+        // producer sees 'batcher_idle_' and serializes on 'mu_' before
+        // notifying, so its notify lands during the wait. Either way no
+        // request can strand in 'staging_' for a full wait timeout.
+        if (!use_staging_ || staging_.EmptyExact()) {
+          cv_.wait_for(lock, wait_timeout);
+        }
+        batcher_idle_.store(false, std::memory_order_relaxed);
       }
     }
 
@@ -560,7 +642,7 @@ DynamicBatchScheduler::GetDynamicBatch()
     }
   }
   size_t best_preferred_batch_size = 0;
-  queued_batch_size_ -= queue_.ApplyPolicyAtCursor();
+  ClampedDecrement(queued_batch_size_, queue_.ApplyPolicyAtCursor());
 
   // When there is optional input or input shape must be enforced,
   // the inputs in the requests must be examined for forming a batch
@@ -594,7 +676,7 @@ DynamicBatchScheduler::GetDynamicBatch()
           (best_preferred_batch_size == 0)) {
         best_preferred_batch_size = pending_batch_size_;
         queue_.MarkCursor();
-        payload_saturated_ = true;
+        payload_saturated_.store(true, std::memory_order_relaxed);
       }
       if ((payload_batch_size + pending_batch_size_ + batch_size) >
           max_batch_size_) {
@@ -625,7 +707,7 @@ DynamicBatchScheduler::GetDynamicBatch()
 
     pending_batch_size_ += batch_size;
     queue_.AdvanceCursor();
-    queued_batch_size_ -= queue_.ApplyPolicyAtCursor();
+    ClampedDecrement(queued_batch_size_, queue_.ApplyPolicyAtCursor());
 
     if (preferred_batch_sizes_.find(pending_batch_size_ + payload_batch_size) !=
         preferred_batch_sizes_.end()) {
@@ -647,7 +729,7 @@ DynamicBatchScheduler::GetDynamicBatch()
   // been exceeded, then execute that.
   if ((best_preferred_batch_size != 0) && !delay_is_exceeded) {
     if (pending_batch_delay_ns_ == 0) {
-      payload_saturated_ = true;
+      payload_saturated_.store(true, std::memory_order_relaxed);
     }
     pending_batch_size_ = best_preferred_batch_size;
     queue_.SetCursorToMark();
@@ -664,7 +746,7 @@ DynamicBatchScheduler::GetDynamicBatch()
   // any larger then just immediately execute whatever is pending.
   if (send_now || ((payload_batch_size + pending_batch_size_) >=
                    max_preferred_batch_size_)) {
-    payload_saturated_ = true;
+    payload_saturated_.store(true, std::memory_order_relaxed);
     return 0;
   }
 
@@ -676,13 +758,18 @@ DynamicBatchScheduler::GetDynamicBatch()
   auto next_preferred_batch_size_it = preferred_batch_sizes_.upper_bound(
       pending_batch_size_ + payload_batch_size);
   if (next_preferred_batch_size_it != preferred_batch_sizes_.end()) {
-    next_preferred_batch_size_ = *next_preferred_batch_size_it;
+    next_preferred_batch_size_.store(
+        *next_preferred_batch_size_it, std::memory_order_relaxed);
   } else {
-    next_preferred_batch_size_ =
-        preferred_batch_sizes_.empty() ? 0 : *preferred_batch_sizes_.begin();
+    next_preferred_batch_size_.store(
+        preferred_batch_sizes_.empty() ? 0 : *preferred_batch_sizes_.begin(),
+        std::memory_order_relaxed);
   }
-  if (next_preferred_batch_size_ != 0) {
-    next_preferred_batch_size_ -= payload_batch_size;
+  if (next_preferred_batch_size_.load(std::memory_order_relaxed) != 0) {
+    // Runs only on the batcher thread, so the load and the subtraction cannot
+    // race with another writer; Enqueue() only reads the value.
+    next_preferred_batch_size_.fetch_sub(
+        payload_batch_size, std::memory_order_relaxed);
   }
 
   // By this point, we have not seen the pending batch that should be executed
@@ -690,7 +777,8 @@ DynamicBatchScheduler::GetDynamicBatch()
   // not yet in preferred batch size, we should move the pending batch over to
   // ensure the model instance will pick up largest available batch even if it
   // is not the preferred batch.
-  if (!payload_saturated_ && (payload_batch_size != 0) &&
+  if (!payload_saturated_.load(std::memory_order_relaxed) &&
+      (payload_batch_size != 0) &&
       (preferred_batch_sizes_.find(payload_batch_size) ==
        preferred_batch_sizes_.end())) {
     return 0;

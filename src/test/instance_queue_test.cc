@@ -622,6 +622,64 @@ TEST_P(PayloadSlotWaitTest, FirstAdmissionWhileBusyWakesBatcher)
   EXPECT_EQ(payload->RequestCount(), 1);
 }
 
+// Several frontend threads enqueue while a consumer takes the payloads one by
+// one: every request must reach a payload, and without the batcher having to
+// ride out its 500 ms wait timeout (each lost wake-up would cost one). This
+// exercises the staging hand-off, which only queues without a policy use.
+TEST_P(PayloadSlotWaitTest, ConcurrentEnqueueDispatchesEveryRequest)
+{
+  if (!GetParam()) {
+    GTEST_SKIP() << "a finite queue rejects most of the burst";
+  }
+  constexpr int kProducers = 4;
+  constexpr int kRequestsPerProducer = 50;
+  constexpr int kTotal = kProducers * kRequestsPerProducer;
+
+  StartBatcher();
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<std::thread> producers;
+  std::atomic<int> enqueue_failures{0};
+  for (int p = 0; p < kProducers; ++p) {
+    producers.emplace_back([&]() {
+      for (int i = 0; i < kRequestsPerProducer; ++i) {
+        auto request = std::make_unique<InferenceRequest>(model_.get(), 1);
+        if (!request->SetResponseCallback(nullptr, nullptr, nullptr, nullptr)
+                 .IsOk() ||
+            !request->PrepareForInference().IsOk() ||
+            !scheduler_->Enqueue(request).IsOk()) {
+          enqueue_failures.fetch_add(1);
+        }
+      }
+    });
+  }
+
+  int dispatched = 0;
+  while (dispatched < kTotal) {
+    auto consumer = Dequeue();
+    if (consumer.wait_for(5s) != std::future_status::ready) {
+      // Unblock the pending DequeuePayload() so the test fails instead of
+      // hanging in the future's destructor.
+      server_.GetRateLimiter()->EnqueuePayload(
+          model_.get(),
+          server_.GetRateLimiter()->GetPayload(Payload::Operation::INFER_RUN));
+      consumer.wait();
+      ADD_FAILURE() << "no payload after " << dispatched << " of " << kTotal
+                    << " requests were dispatched";
+      break;
+    }
+    auto payload = consumer.get();
+    dispatched += payload->RequestCount();
+    server_.GetRateLimiter()->PayloadRelease(payload);
+  }
+  for (auto& producer : producers) {
+    producer.join();
+  }
+
+  EXPECT_EQ(enqueue_failures.load(), 0);
+  EXPECT_EQ(dispatched, kTotal);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 3s);
+}
+
 // The reject pass of the slot wait must run when the closest queued deadline
 // expires, not only when the 500 ms window does: without the clamp the 50 ms
 // timeout is enforced about 500 ms after the batcher starts waiting.
