@@ -450,13 +450,13 @@ class PayloadSlotWaitTest : public ::testing::TestWithParam<bool> {
     inference::ModelConfig config;
     config.set_name("test");
     config.set_backend("test");
-    config.set_max_batch_size(1);
+    config.set_max_batch_size(max_batch_size_);
     config.mutable_version_policy()->mutable_latest()->set_num_versions(1);
     auto* group = config.add_instance_group();
     group->set_kind(inference::ModelInstanceGroup::KIND_CPU);
     group->set_count(1);
     group->set_passive(true);
-    batcher_config_.add_preferred_batch_size(1);
+    batcher_config_.add_preferred_batch_size(max_batch_size_);
     batcher_config_.mutable_default_queue_policy()->set_max_queue_size(
         GetParam() ? 0 : 1);
     status = TritonModel::Create(
@@ -537,7 +537,8 @@ class PayloadSlotWaitTest : public ::testing::TestWithParam<bool> {
   void StartBatcher()
   {
     auto status = DynamicBatchScheduler::Create(
-        model_.get(), nullptr, 0, true, 1, {}, batcher_config_, &scheduler_);
+        model_.get(), nullptr, 0, true, max_batch_size_, {}, batcher_config_,
+        &scheduler_);
     ASSERT_TRUE(status.IsOk()) << status.Message();
     // Let the batcher enter its empty-queue wait before the first admission.
     std::this_thread::sleep_for(50ms);
@@ -565,6 +566,7 @@ class PayloadSlotWaitTest : public ::testing::TestWithParam<bool> {
     return true;
   }
 
+  int max_batch_size_ = 1;
   InferenceServer server_;
   std::unique_ptr<TritonModel> model_;
   std::shared_ptr<TritonModelInstance> instance_;
@@ -732,6 +734,43 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<bool>& info) {
       return info.param ? "Prefetch" : "Finite";
     });
+
+// Batches of up to four requests, on the staging hand-off of prefetching
+// queues.
+class StagedBatchTest : public PayloadSlotWaitTest {
+ public:
+  StagedBatchTest() { max_batch_size_ = 4; }
+};
+
+// Requests that arrive while the batcher is blocked waiting for a slot must
+// join the batch it forms as soon as the slot is available.
+TEST_P(StagedBatchTest, RequestsArrivingDuringSlotWaitJoinTheBatch)
+{
+  FillPrefetchQueue();
+  StartBatcher();
+  EnqueueRequest();
+  // The batcher picks the first request up after its 500 ms idle wait, then
+  // blocks waiting for a slot.
+  std::this_thread::sleep_for(700ms);
+  for (int i = 0; i < 3; ++i) {
+    EnqueueRequest();
+  }
+
+  // The two filler payloads come out first; the first one frees a slot.
+  int batch_size = 0;
+  for (int i = 0; i < 3 && batch_size == 0; ++i) {
+    auto consumer = Dequeue();
+    ASSERT_EQ(consumer.wait_for(2s), std::future_status::ready);
+    auto payload = consumer.get();
+    batch_size = payload->RequestCount();
+    server_.GetRateLimiter()->PayloadRelease(payload);
+  }
+  EXPECT_EQ(batch_size, 4);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Staging, StagedBatchTest, ::testing::Values(true),
+    [](const ::testing::TestParamInfo<bool>&) { return "Prefetch"; });
 
 }}  // namespace triton::core
 #endif

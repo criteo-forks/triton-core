@@ -461,6 +461,13 @@ DynamicBatchScheduler::BatcherThread(const int nice)
           break;
         }
 
+        // Requests that arrived during the slot wait are still staged; take
+        // them into account for the batch formed below instead of leaving them
+        // to the next iteration.
+        if (use_staging_) {
+          DrainStagingToQueue();
+        }
+
         {
           std::lock_guard<std::mutex> exec_lock(
               *(curr_payload_->GetExecMutex()));
