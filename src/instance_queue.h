@@ -73,8 +73,13 @@ class InstanceQueue {
   // RateLimiter::PayloadQueue::mu_; SizeApprox() reads it without the lock.
   std::atomic<size_t> size_{0};
 
-  int waiting_consumer_count_;
-  bool closed_;
+  // Consumer bookkeeping runs on every payload enqueue/dequeue, so the count is
+  // atomic and the mutex+cv pair is only engaged while a WaitForConsumer()
+  // caller is registered in 'consumer_waiters_'. 'closed_' is written under
+  // 'waiting_consumer_mu_' and read lock-free by WaitingConsumerCount().
+  std::atomic<int> waiting_consumer_count_{0};
+  std::atomic<int> consumer_waiters_{0};
+  std::atomic<bool> closed_{false};
   std::mutex waiting_consumer_mu_;
   std::condition_variable waiting_consumer_cv_;
 };

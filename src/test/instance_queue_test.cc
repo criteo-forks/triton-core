@@ -39,6 +39,7 @@ TRITONBACKEND_ModelInstanceExecute(
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "dynamic_batch_scheduler.h"
@@ -273,6 +274,108 @@ TEST(InstanceQueueTest, SizeApproxTracksMergedDequeues)
   ASSERT_EQ(merged_payloads.size(), static_cast<size_t>(kBurst - 1));
   EXPECT_EQ(queue.SizeApprox(), 0u);
   EXPECT_EQ(queue.SizeApprox(), queue.Size());
+}
+
+// Runs the untimed WaitForConsumer() on its own thread. The destructor closes
+// the queue before joining, so a waiter that was never released fails the
+// test instead of hanging it.
+class ConsumerWaiter {
+ public:
+  explicit ConsumerWaiter(InstanceQueue* queue) : queue_(queue)
+  {
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    thread_ = std::thread([this, &started]() {
+      started.set_value();
+      queue_->WaitForConsumer();
+      released_.set_value();
+    });
+    started_future.wait();
+    // The thread may not be parked yet; registering late only weakens a test
+    // into the immediate-return case, it cannot make one fail.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  ~ConsumerWaiter()
+  {
+    queue_->Close();
+    thread_.join();
+  }
+
+  bool Released(std::chrono::milliseconds timeout)
+  {
+    return released_future_.wait_for(timeout) == std::future_status::ready;
+  }
+
+ private:
+  InstanceQueue* queue_;
+  std::promise<void> released_;
+  std::future<void> released_future_{released_.get_future()};
+  std::thread thread_;
+};
+
+// The consumer count is a lock-free atomic: increments and decrements must
+// balance exactly, including through negative values (EnqueuePayload
+// decrements before any consumer parks).
+TEST(InstanceQueueTest, ConsumerCountArithmetic)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+
+  EXPECT_EQ(queue.WaitingConsumerCount(), 0);
+  queue.DecrementConsumerCount();
+  EXPECT_EQ(queue.WaitingConsumerCount(), -1);
+  queue.IncrementConsumerCount();
+  queue.IncrementConsumerCount();
+  EXPECT_EQ(queue.WaitingConsumerCount(), 1);
+}
+
+// WaitForConsumer() must return at once when a consumer is already counted;
+// no notification can be required.
+TEST(InstanceQueueTest, WaitForConsumerReturnsWhenConsumerPresent)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+  queue.IncrementConsumerCount();
+
+  ConsumerWaiter waiter(&queue);
+  EXPECT_TRUE(waiter.Released(std::chrono::seconds(5)))
+      << "WaitForConsumer() blocked although a consumer was already counted";
+}
+
+// Missed-wakeup regression for the waiter registration: a blocked
+// WaitForConsumer() must be released by IncrementConsumerCount() from another
+// thread, although increments only notify while a waiter is registered.
+TEST(InstanceQueueTest, WaitForConsumerWokenByIncrement)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+
+  ConsumerWaiter waiter(&queue);
+  queue.IncrementConsumerCount();
+  EXPECT_TRUE(waiter.Released(std::chrono::seconds(5)))
+      << "IncrementConsumerCount() failed to wake a blocked WaitForConsumer()";
+}
+
+// Several callers can be blocked at once. Each increment wakes one of them, and
+// the one still blocked after the first returned must be woken by the next
+// increment: waiter registration must be a counter, not a flag cleared by the
+// first caller to return.
+TEST(InstanceQueueTest, EveryBlockedWaiterIsEventuallyWoken)
+{
+  InstanceQueue queue(1 /* max_batch_size */, 0 /* max_queue_delay_ns */);
+
+  ConsumerWaiter first(&queue);
+  ConsumerWaiter second(&queue);
+
+  queue.IncrementConsumerCount();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!first.Released(std::chrono::milliseconds(10)) &&
+         !second.Released(std::chrono::milliseconds(10)) &&
+         std::chrono::steady_clock::now() < deadline) {
+  }
+
+  queue.IncrementConsumerCount();
+  EXPECT_TRUE(first.Released(std::chrono::seconds(5)));
+  EXPECT_TRUE(second.Released(std::chrono::seconds(5)));
 }
 
 }  // namespace
