@@ -111,6 +111,10 @@ class DynamicBatchScheduler : public Scheduler {
   // Moves the requests staged by Enqueue() into 'queue_'. 'mu_' must be held
   // when this function is called.
   void DrainStagingToQueue();
+
+  // Wakes the batcher thread from a thread that does not hold 'mu_'. Safe
+  // against the batcher being about to park, see 'batcher_idle_'.
+  void NotifyBatcher();
   void DelegateResponse(std::unique_ptr<InferenceRequest>& request);
   void CacheLookUp(
       std::unique_ptr<InferenceRequest>& request,
@@ -184,10 +188,10 @@ class DynamicBatchScheduler : public Scheduler {
   std::condition_variable cv_;
 
   // Set (while holding 'mu_') immediately before the batcher thread parks in
-  // cv_.wait_for() and cleared right after it wakes. Enqueue() uses it to
-  // close a lost-wakeup race: a producer that sees it set takes an empty lock
-  // on 'mu_' before notifying, which serializes the notify with the batcher's
-  // wait/wake transition.
+  // cv_.wait_for() and cleared right after it wakes. NotifyBatcher() uses it
+  // to close a lost-wakeup race: a notifier that sees it set takes an empty
+  // lock on 'mu_' before notifying, which serializes the notify with the
+  // batcher's wait/wake transition.
   std::atomic<bool> batcher_idle_{false};
 
   std::shared_ptr<RateLimiter> rate_limiter_;
