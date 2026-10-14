@@ -248,8 +248,8 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     auto payload = model_->Server()->GetRateLimiter()->GetPayload(
         Payload::Operation::INFER_RUN, nullptr /* TritonModelInstance*/);
     payload->AddRequest(std::move(request));
-    RETURN_IF_ERROR(
-        model_->Server()->GetRateLimiter()->EnqueuePayload(model_, payload));
+    RETURN_IF_ERROR(model_->Server()->GetRateLimiter()->EnqueuePayload(
+        model_, payload, CachedPayloadQueue()));
 
   } else {
     bool wake_batcher = true;
@@ -272,7 +272,8 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
       // be available.
       wake_batcher = model_->Server()->GetRateLimiter()->PayloadSlotAvailable(
           model_, model_instance_, queue_.SupportPrefetching(),
-          true /*force_non_blocking*/);
+          true /*force_non_blocking*/, 0 /*wait_microseconds*/,
+          {} /*stop_token*/, CachedPayloadQueue());
 
       // We may wake up runner less often if we don't enforce equal shape
       // within a batch, otherwise must always wake up runner to check it
@@ -452,7 +453,8 @@ DynamicBatchScheduler::BatcherThread(const int nice)
       }
     }
     if (payload_ready) {
-      model_->Server()->GetRateLimiter()->EnqueuePayload(model_, curr_payload_);
+      model_->Server()->GetRateLimiter()->EnqueuePayload(
+          model_, curr_payload_, CachedPayloadQueue());
     }
 
     // Finish rejected and cancelled requests if any
@@ -481,7 +483,8 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
     // consumer availability without prefetching, payload queue size otherwise.
     slot_available = rate_limiter_->PayloadSlotAvailable(
         model_, model_instance_, queue_.SupportPrefetching(),
-        false /* force_non_blocking */, wait_microseconds, stop_token);
+        false /* force_non_blocking */, wait_microseconds, stop_token,
+        CachedPayloadQueue());
     if (!slot_available && !stop_token.stop_requested()) {
       // Reject and release timeout requests from queue.
       std::vector<std::deque<std::unique_ptr<InferenceRequest>>>

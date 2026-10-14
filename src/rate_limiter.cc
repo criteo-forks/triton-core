@@ -1,4 +1,4 @@
-// Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -169,29 +169,32 @@ RateLimiter::UnregisterModel(const TritonModel* model)
   }
 }
 
+RateLimiter::PayloadQueue*
+RateLimiter::LookupPayloadQueue(const TritonModel* model)
+{
+  std::lock_guard<std::mutex> lk(payload_queues_mu_);
+  auto it = payload_queues_.find(model);
+  if (it == payload_queues_.end()) {
+    return nullptr;
+  }
+  return it->second.get();
+}
+
 bool
 RateLimiter::WaitForConsumer(
-    const TritonModel* model, const TritonModelInstance* model_instance,
+    PayloadQueue* payload_queue, const TritonModelInstance* model_instance,
     const uint64_t wait_microseconds, std::stop_token stop_token)
 {
   std::shared_ptr<InstanceQueue> queue;
-  {
-    std::lock_guard<std::mutex> lk(payload_queues_mu_);
-    auto p_it = payload_queues_.find(model);
-    if (p_it == payload_queues_.end()) {
+  if (model_instance == nullptr) {
+    queue = payload_queue->queue_;
+  } else {
+    std::lock_guard<std::mutex> lk(payload_queue->mu_);
+    auto s_it = payload_queue->specific_queues_.find(model_instance);
+    if (s_it == payload_queue->specific_queues_.end()) {
       return false;
     }
-    auto* payload_queue = p_it->second.get();
-    if (model_instance == nullptr) {
-      queue = payload_queue->queue_;
-    } else {
-      std::lock_guard<std::mutex> lk(payload_queue->mu_);
-      auto s_it = payload_queue->specific_queues_.find(model_instance);
-      if (s_it == payload_queue->specific_queues_.end()) {
-        return false;
-      }
-      queue = s_it->second;
-    }
+    queue = s_it->second;
   }
 
   if (wait_microseconds != 0) {
@@ -204,19 +207,8 @@ RateLimiter::WaitForConsumer(
 
 int
 RateLimiter::WaitingConsumerCount(
-    const TritonModel* model, const TritonModelInstance* model_instance)
+    PayloadQueue* payload_queue, const TritonModelInstance* model_instance)
 {
-  PayloadQueue* payload_queue = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(payload_queues_mu_);
-    if (payload_queues_.find(model) == payload_queues_.end()) {
-      LOG_ERROR << "Unable to find the payload queue for the model "
-                << model->Name();
-      return 0;
-    }
-    payload_queue = payload_queues_[model].get();
-  }
-
   if (model_instance == nullptr) {
     return payload_queue->queue_->WaitingConsumerCount();
   } else {
@@ -232,15 +224,20 @@ bool
 RateLimiter::PayloadSlotAvailable(
     const TritonModel* model, const TritonModelInstance* model_instance,
     const bool support_prefetching, const bool force_non_blocking,
-    const uint64_t wait_microseconds, std::stop_token stop_token)
+    const uint64_t wait_microseconds, std::stop_token stop_token,
+    PayloadQueue* payload_queue)
 {
+  if (payload_queue == nullptr) {
+    payload_queue = LookupPayloadQueue(model);
+    if (payload_queue == nullptr) {
+      LOG_ERROR << "Unable to find the payload queue for the model "
+                << (model ? model->Name() : std::string("<null>"));
+      return false;
+    }
+  }
+
   bool result;
   if (support_prefetching) {
-    PayloadQueue* payload_queue = nullptr;
-    {
-      std::lock_guard<std::mutex> lk(payload_queues_mu_);
-      payload_queue = payload_queues_[model].get();
-    }
     // The logic below sets cap on the number of payloads that
     // can be pre-fetched. For per-model batcher the cap is
     // twice the number of model instances. For per-instance
@@ -267,10 +264,10 @@ RateLimiter::PayloadSlotAvailable(
     }
   } else {
     if (force_non_blocking) {
-      result = (WaitingConsumerCount(model, model_instance) > 0);
+      result = (WaitingConsumerCount(payload_queue, model_instance) > 0);
     } else {
-      result =
-          WaitForConsumer(model, model_instance, wait_microseconds, stop_token);
+      result = WaitForConsumer(
+          payload_queue, model_instance, wait_microseconds, stop_token);
     }
   }
   return result;
@@ -278,18 +275,18 @@ RateLimiter::PayloadSlotAvailable(
 
 Status
 RateLimiter::EnqueuePayload(
-    const TritonModel* model, std::shared_ptr<Payload> payload)
+    const TritonModel* model, std::shared_ptr<Payload> payload,
+    PayloadQueue* payload_queue)
 {
   auto pinstance = payload->GetInstance();
-  PayloadQueue* payload_queue = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(payload_queues_mu_);
-    if (payload_queues_.find(model) == payload_queues_.end()) {
+  if (payload_queue == nullptr) {
+    payload_queue = LookupPayloadQueue(model);
+    if (payload_queue == nullptr) {
       return Status(
           Status::Code::INTERNAL,
-          "Unable to find the payload queue for the model " + model->Name());
+          "Unable to find the payload queue for the model " +
+              (model ? model->Name() : std::string("<null>")));
     }
-    payload_queue = payload_queues_[model].get();
   }
 
   {
@@ -335,19 +332,17 @@ RateLimiter::EnqueuePayload(
 void
 RateLimiter::DequeuePayload(
     std::deque<TritonModelInstance*>& instances,
-    std::shared_ptr<Payload>* payload)
+    std::shared_ptr<Payload>* payload, PayloadQueue* payload_queue)
 {
   payload->reset();
-  PayloadQueue* payload_queue = nullptr;
-  auto model = instances[0]->Model();
-  {
-    std::lock_guard<std::mutex> lk(payload_queues_mu_);
-    if (payload_queues_.find(model) == payload_queues_.end()) {
+  if (payload_queue == nullptr) {
+    auto model = instances[0]->Model();
+    payload_queue = LookupPayloadQueue(model);
+    if (payload_queue == nullptr) {
       LOG_ERROR << "Unable to find the payload queue for the model "
                 << model->Name();
       return;
     }
-    payload_queue = payload_queues_[model].get();
   }
 
   std::vector<std::shared_ptr<Payload>> merged_payloads;
