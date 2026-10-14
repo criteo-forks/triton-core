@@ -607,6 +607,48 @@ install(DIRECTORY ${INSTANCE_QUEUE_TEST_MODELS}/empty DESTINATION bin/instance_q
 install(DIRECTORY ${INSTANCE_QUEUE_TEST_MODELS}/test/1 DESTINATION bin/instance_queue_test_models/test)
 
 #
+# Unit test for Payload
+#
+add_executable(
+  payload_test
+  payload_test.cc
+)
+
+set_target_properties(
+  payload_test
+  PROPERTIES
+    SKIP_BUILD_RPATH TRUE
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    INSTALL_RPATH ""
+)
+
+target_include_directories(
+  payload_test
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${GTEST_INCLUDE_DIRS}
+)
+
+target_link_libraries(
+  payload_test
+  PRIVATE
+    triton-common-error   # from repo-common
+    triton-common-logging # from repo-common
+    proto-library         # from repo-common
+    triton-core
+    GTest::gtest
+    GTest::gtest_main
+    protobuf::libprotobuf
+)
+
+install(
+  TARGETS payload_test
+  RUNTIME DESTINATION bin
+)
+
+#
 # Backend Output Detail Unittest
 #
 add_executable(
