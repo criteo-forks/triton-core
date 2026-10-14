@@ -1,4 +1,4 @@
-// Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <algorithm>
 #include <deque>
 #include <unordered_map>
 
@@ -34,6 +35,26 @@
 namespace triton { namespace core {
 
 uint64_t CaptureTimeNs();
+
+// Clamps a wait window to the time left until 'closest_timeout_ns' (0 means no
+// deadline). The 1 ms floor keeps a deadline that is close or already past
+// from turning the wait into a busy poll.
+inline uint64_t
+ClampWaitToDeadline(
+    uint64_t wait_microseconds, uint64_t closest_timeout_ns, uint64_t now_ns)
+{
+  if (closest_timeout_ns == 0) {
+    return wait_microseconds;
+  }
+  constexpr uint64_t kFloorMicroseconds = 1000;
+  if (now_ns >= closest_timeout_ns) {
+    return kFloorMicroseconds;
+  }
+  const uint64_t remaining_us = (closest_timeout_ns - now_ns) / 1000;
+  return std::min(
+      wait_microseconds, std::max(remaining_us, kFloorMicroseconds));
+}
+
 // Utility function called by the scheduler to lookup if the request is in the
 // cache and get the response.
 bool CacheLookUpUtil(
