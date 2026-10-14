@@ -1,4 +1,4 @@
-// Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -336,6 +336,22 @@ PriorityQueue::PolicyQueue::TimeoutAt(size_t idx)
   }
 }
 
+uint64_t
+PriorityQueue::PolicyQueue::ClosestRejectTimeout()
+{
+  if (timeout_action_ != inference::ModelQueuePolicy::REJECT) {
+    return 0;
+  }
+
+  uint64_t closest_ns = 0;
+  for (const uint64_t timeout_ns : timeout_timestamp_ns_) {
+    if ((timeout_ns != 0) && ((closest_ns == 0) || (timeout_ns < closest_ns))) {
+      closest_ns = timeout_ns;
+    }
+  }
+  return closest_ns;
+}
+
 bool
 PriorityQueue::PolicyQueue::ReadyForErasure()
 {
@@ -467,6 +483,19 @@ PriorityQueue::ReleaseSkippedRequests(
 
   rejected_requests->swap(reject_req);
   cancelled_requests->swap(cancel_req);
+}
+
+uint64_t
+PriorityQueue::ClosestRejectTimeout()
+{
+  uint64_t closest_ns = 0;
+  for (auto& queue : queues_) {
+    const uint64_t timeout_ns = queue.second.ClosestRejectTimeout();
+    if ((timeout_ns != 0) && ((closest_ns == 0) || (timeout_ns < closest_ns))) {
+      closest_ns = timeout_ns;
+    }
+  }
+  return closest_ns;
 }
 
 bool

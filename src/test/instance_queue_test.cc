@@ -382,6 +382,46 @@ TEST(InstanceQueueTest, EveryBlockedWaiterIsEventuallyWoken)
 
 using namespace std::chrono_literals;
 
+// Error responses never allocate output buffers, but a response needs an
+// allocator to be constructed.
+TRITONSERVER_Error*
+UnusedResponseAlloc(
+    TRITONSERVER_ResponseAllocator* allocator, const char* tensor_name,
+    size_t byte_size, TRITONSERVER_MemoryType memory_type,
+    int64_t memory_type_id, void* userp, void** buffer, void** buffer_userp,
+    TRITONSERVER_MemoryType* actual_memory_type, int64_t* actual_memory_type_id)
+{
+  return TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_INTERNAL, "unused");
+}
+
+TRITONSERVER_Error*
+UnusedResponseRelease(
+    TRITONSERVER_ResponseAllocator* allocator, void* buffer, void* buffer_userp,
+    size_t byte_size, TRITONSERVER_MemoryType memory_type,
+    int64_t memory_type_id)
+{
+  return nullptr;
+}
+
+void
+CountErrorResponse(
+    TRITONSERVER_InferenceResponse* response, const uint32_t flags, void* userp)
+{
+  TRITONSERVER_Error* error = TRITONSERVER_InferenceResponseError(response);
+  if (error != nullptr) {
+    static_cast<std::atomic<int>*>(userp)->fetch_add(1);
+    TRITONSERVER_ErrorDelete(error);
+  }
+  TRITONSERVER_InferenceResponseDelete(response);
+}
+
+void
+DeleteReleasedRequest(
+    TRITONSERVER_InferenceRequest* request, const uint32_t flags, void* userp)
+{
+  TRITONSERVER_InferenceRequestDelete(request);
+}
+
 // Public factories create passive instances so tests can control availability
 // through RateLimiter::DequeuePayload without a backend thread.
 class PayloadSlotWaitTest : public ::testing::TestWithParam<bool> {
@@ -466,6 +506,30 @@ class PayloadSlotWaitTest : public ::testing::TestWithParam<bool> {
     auto request = std::make_unique<InferenceRequest>(model_.get(), 1);
     ASSERT_TRUE(request->SetResponseCallback(nullptr, nullptr, nullptr, nullptr)
                     .IsOk());
+    ASSERT_TRUE(request->PrepareForInference().IsOk());
+    ASSERT_TRUE(scheduler_->Enqueue(request).IsOk());
+  }
+
+  // Like EnqueueRequest(), for requests that the scheduler may finish with an
+  // error: counts the error responses in 'errors'.
+  void EnqueueRejectableRequest(std::atomic<int>* errors)
+  {
+    static TRITONSERVER_ResponseAllocator* allocator = []() {
+      TRITONSERVER_ResponseAllocator* a = nullptr;
+      EXPECT_EQ(
+          TRITONSERVER_ResponseAllocatorNew(
+              &a, UnusedResponseAlloc, UnusedResponseRelease, nullptr),
+          nullptr);
+      return a;
+    }();
+    auto request = std::make_unique<InferenceRequest>(model_.get(), 1);
+    ASSERT_TRUE(request
+                    ->SetResponseCallback(
+                        reinterpret_cast<ResponseAllocator*>(allocator),
+                        nullptr, CountErrorResponse, errors)
+                    .IsOk());
+    ASSERT_TRUE(
+        request->SetReleaseCallback(DeleteReleasedRequest, nullptr).IsOk());
     ASSERT_TRUE(request->PrepareForInference().IsOk());
     ASSERT_TRUE(scheduler_->Enqueue(request).IsOk());
   }
@@ -556,6 +620,25 @@ TEST_P(PayloadSlotWaitTest, FirstAdmissionWhileBusyWakesBatcher)
   auto payload = consumer.get();
   ASSERT_NE(payload, nullptr);
   EXPECT_EQ(payload->RequestCount(), 1);
+}
+
+// The reject pass of the slot wait must run when the closest queued deadline
+// expires, not only when the 500 ms window does: without the clamp the 50 ms
+// timeout is enforced about 500 ms after the batcher starts waiting.
+TEST_P(PayloadSlotWaitTest, RejectTimeoutIsEnforcedDuringSlotWait)
+{
+  auto* policy = batcher_config_.mutable_default_queue_policy();
+  policy->set_timeout_action(inference::ModelQueuePolicy::REJECT);
+  policy->set_default_timeout_microseconds(50 * 1000);
+  if (GetParam()) {
+    FillPrefetchQueue();
+  }
+  std::atomic<int> errors{0};
+  StartBatcher();
+  EnqueueRejectableRequest(&errors);
+  std::this_thread::sleep_for(250ms);
+  EXPECT_EQ(errors.load(), 1);
+  EXPECT_EQ(scheduler_->InflightInferenceCount(), 0);
 }
 
 TEST_P(PayloadSlotWaitTest, ShutdownInterruptsEmptyQueueWait)

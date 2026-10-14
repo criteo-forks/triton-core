@@ -486,12 +486,11 @@ DynamicBatchScheduler::WaitForPayloadSlotAvailable(
   // Enqueue threads above to make progress.
   //
   // While blocked here, request timeouts are only enforced when the wait
-  // expires, so each wait window is clamped to the closest deadline of the
-  // pending batch (when timeout policies are in use) instead of always
-  // waiting the full 'wait_microseconds'. Without configured timeouts the
-  // behavior is unchanged. The clamp tracks the pending batch's deadlines;
-  // requests arriving during the wait are picked up when their deadline enters
-  // the pending batch on a later batching pass.
+  // expires, so each wait window is clamped to the closest rejecting deadline
+  // among the queued requests (when timeout policies are in use) instead of
+  // always waiting the full 'wait_microseconds'. Without configured timeouts
+  // the behavior is unchanged. Requests that arrive during a wait are taken
+  // into account from the next window on.
   uint64_t clamped_wait_us = ClampWaitToClosestTimeout(wait_microseconds);
   lock->unlock();
 
@@ -534,7 +533,7 @@ DynamicBatchScheduler::ClampWaitToClosestTimeout(uint64_t wait_microseconds)
           std::chrono::steady_clock::now().time_since_epoch())
           .count();
   return ClampWaitToDeadline(
-      wait_microseconds, queue_.ClosestTimeout(), now_ns);
+      wait_microseconds, queue_.ClosestRejectTimeout(), now_ns);
 }
 
 uint64_t

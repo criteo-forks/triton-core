@@ -181,6 +181,11 @@ class PriorityQueue {
     return pending_cursor_.pending_batch_closest_timeout_ns_;
   }
 
+  // Return the earliest timeout timestamp (ns) among all queued requests whose
+  // queue policy rejects on timeout, or 0 if there is none. Unlike
+  // ClosestTimeout() it does not depend on the pending batch.
+  uint64_t ClosestRejectTimeout();
+
   // Return the number of requests in pending batch.
   size_t PendingBatchCount() { return pending_cursor_.pending_batch_count_; }
 
@@ -256,6 +261,10 @@ class PriorityQueue {
     // Return the timeout timestamp of the request at 'idx', in ns. A value of 0
     // indicates that the request doesn't specify a timeout.
     uint64_t TimeoutAt(size_t idx);
+
+    // Return the earliest timeout timestamp of the queued requests, in ns, if
+    // 'timeout_action_' is to reject; 0 otherwise or if no request has one.
+    uint64_t ClosestRejectTimeout();
 
     // Return whether the queue is empty, rejected requests are not included.
     bool Empty() { return Size() == 0; }
