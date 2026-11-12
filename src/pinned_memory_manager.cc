@@ -72,7 +72,8 @@ std::vector<std::shared_ptr<PinnedMemoryManager::PinnedMemory>>
 
 PinnedMemoryManager::PinnedMemory::PinnedMemory(
     void* pinned_memory_buffer, uint64_t size)
-    : pinned_memory_buffer_(pinned_memory_buffer)
+    : pinned_memory_buffer_(pinned_memory_buffer),
+      pinned_memory_buffer_size_((pinned_memory_buffer == nullptr) ? 0 : size)
 {
   used_pinned_memory_byte_size_ = 0;
   if (pinned_memory_buffer_ != nullptr) {
@@ -96,8 +97,10 @@ PinnedMemoryManager::PinnedMemory::Allocate(uint64_t size)
 {
   std::lock_guard<std::mutex> lk(buffer_mtx_);
   void* ptr = managed_pinned_memory_.allocate(size, std::nothrow_t{});
-  used_pinned_memory_byte_size_ += size;
-  allocated_memory_info_.emplace(ptr, size);
+  if (ptr != nullptr) {
+    used_pinned_memory_byte_size_ +=
+        managed_pinned_memory_.get_segment_manager()->size(ptr);
+  }
   return ptr;
 }
 
@@ -105,12 +108,18 @@ void
 PinnedMemoryManager::PinnedMemory::Deallocate(void* ptr)
 {
   std::lock_guard<std::mutex> lk(buffer_mtx_);
+  used_pinned_memory_byte_size_ -=
+      managed_pinned_memory_.get_segment_manager()->size(ptr);
   managed_pinned_memory_.deallocate(ptr);
-  auto it = allocated_memory_info_.find(ptr);
-  if (it != allocated_memory_info_.end()) {
-    used_pinned_memory_byte_size_ -= it->second;
-    allocated_memory_info_.erase(it);
-  }
+}
+
+bool
+PinnedMemoryManager::PinnedMemory::Contains(const void* ptr) const
+{
+  const auto base = reinterpret_cast<uintptr_t>(pinned_memory_buffer_);
+  const auto addr = reinterpret_cast<uintptr_t>(ptr);
+  return (pinned_memory_buffer_ != nullptr) && (addr >= base) &&
+         (addr < base + pinned_memory_buffer_size_);
 }
 
 uint64_t
@@ -124,12 +133,6 @@ PinnedMemoryManager::~PinnedMemoryManager()
 {
   // Clean up
   allocated_pinned_memory_buffers_.clear();
-  for (const auto& memory_info : memory_info_) {
-    const auto& is_pinned = memory_info.second.first;
-    if (!is_pinned) {
-      free(memory_info.first);
-    }
-  }
 }
 
 void
@@ -149,97 +152,57 @@ PinnedMemoryManager::AllocInternal(
     void** ptr, uint64_t size, TRITONSERVER_MemoryType* allocated_type,
     bool allow_nonpinned_fallback, PinnedMemory* pinned_memory_buffer)
 {
-  auto status = Status::Success;
-  if (pinned_memory_buffer->pinned_memory_buffer_ != nullptr) {
+  const bool has_pool =
+      (pinned_memory_buffer->pinned_memory_buffer_ != nullptr);
+  if (has_pool) {
     *ptr = pinned_memory_buffer->Allocate(size);
-    *allocated_type = TRITONSERVER_MEMORY_CPU_PINNED;
-    if (*ptr == nullptr) {
-      status = Status(
-          Status::Code::INTERNAL, "failed to allocate pinned system memory");
-    }
-  } else {
-    status = Status(
-        Status::Code::INTERNAL,
-        "failed to allocate pinned system memory: no pinned memory pool");
-  }
-
-  bool is_pinned = true;
-  if ((!status.IsOk()) && allow_nonpinned_fallback) {
-    static bool warning_logged = false;
-    if (!warning_logged) {
-      LOG_WARNING << status.Message()
-                  << ", falling back to non-pinned system memory";
-      warning_logged = true;
-    }
-    *ptr = malloc(size);
-    *allocated_type = TRITONSERVER_MEMORY_CPU;
-    is_pinned = false;
-    if (*ptr == nullptr) {
-      status = Status(
-          Status::Code::INTERNAL,
-          "failed to allocate non-pinned system memory");
-    } else {
-      status = Status::Success;
-    }
-  }
-
-  // keep track of allocated buffer or clean up
-  {
-    std::lock_guard<std::mutex> lk(info_mtx_);
-    if (status.IsOk()) {
-      auto res = memory_info_.emplace(
-          *ptr, std::make_pair(is_pinned, pinned_memory_buffer));
-      if (!res.second) {
-        status = Status(
-            Status::Code::INTERNAL, "unexpected memory address collision, '" +
-                                        PointerToString(*ptr) +
-                                        "' has been managed");
-      }
-      LOG_VERBOSE(1) << (is_pinned ? "" : "non-")
-                     << "pinned memory allocation: "
+    if (*ptr != nullptr) {
+      *allocated_type = TRITONSERVER_MEMORY_CPU_PINNED;
+      LOG_VERBOSE(1) << "pinned memory allocation: "
                      << "size " << size << ", addr " << *ptr;
+      return Status::Success;
     }
   }
 
-  if ((!status.IsOk()) && (*ptr != nullptr)) {
-    if (is_pinned) {
-      pinned_memory_buffer->Deallocate(*ptr);
-    } else {
-      free(*ptr);
-    }
+  const char* pinned_error =
+      has_pool
+          ? "failed to allocate pinned system memory"
+          : "failed to allocate pinned system memory: no pinned memory pool";
+  if (!allow_nonpinned_fallback) {
+    return Status(Status::Code::INTERNAL, pinned_error);
   }
 
-  return status;
+  static bool warning_logged = false;
+  if (!warning_logged) {
+    LOG_WARNING << pinned_error << ", falling back to non-pinned system memory";
+    warning_logged = true;
+  }
+  *ptr = malloc(size);
+  *allocated_type = TRITONSERVER_MEMORY_CPU;
+  if (*ptr == nullptr) {
+    return Status(
+        Status::Code::INTERNAL, "failed to allocate non-pinned system memory");
+  }
+  LOG_VERBOSE(1) << "non-pinned memory allocation: "
+                 << "size " << size << ", addr " << *ptr;
+  return Status::Success;
 }
 
 Status
 PinnedMemoryManager::FreeInternal(void* ptr)
 {
-  bool is_pinned = true;
-  PinnedMemory* pinned_memory_buffer = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(info_mtx_);
-    auto it = memory_info_.find(ptr);
-    if (it != memory_info_.end()) {
-      is_pinned = it->second.first;
-      pinned_memory_buffer = it->second.second;
-      LOG_VERBOSE(1) << (is_pinned ? "" : "non-")
-                     << "pinned memory deallocation: "
+  for (const auto& pinned_memory_buffer : pinned_memory_buffers_) {
+    if (pinned_memory_buffer.second->Contains(ptr)) {
+      LOG_VERBOSE(1) << "pinned memory deallocation: "
                      << "addr " << ptr;
-      memory_info_.erase(it);
-    } else {
-      return Status(
-          Status::Code::INTERNAL, "unexpected memory address '" +
-                                      PointerToString(ptr) +
-                                      "' is not being managed");
+      pinned_memory_buffer.second->Deallocate(ptr);
+      return Status::Success;
     }
   }
 
-  if (is_pinned) {
-    pinned_memory_buffer->Deallocate(ptr);
-  } else {
-    free(ptr);
-  }
+  LOG_VERBOSE(1) << "non-pinned memory deallocation: "
+                 << "addr " << ptr;
+  free(ptr);
   return Status::Success;
 }
 

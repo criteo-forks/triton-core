@@ -207,10 +207,9 @@ struct Step {
 
   std::mutex output_mtx_;
   // Different output map to avoid address conflict from different memory types
-  std::unordered_map<uintptr_t, std::shared_ptr<AllocatedMemory>>
-      cpu_output_map_;
+  std::unordered_map<uintptr_t, std::shared_ptr<MutableMemory>> cpu_output_map_;
   std::unordered_map<
-      int64_t, std::unordered_map<uintptr_t, std::shared_ptr<AllocatedMemory>>>
+      int64_t, std::unordered_map<uintptr_t, std::shared_ptr<MutableMemory>>>
       gpu_output_map_;
   std::set<std::pair<std::string, IterationCount>> updated_tensors_;
 
@@ -630,8 +629,13 @@ EnsembleContext::ResponseAlloc(
   *buffer = nullptr;
   *buffer_userp = nullptr;
 
-  auto allocated_buffer = std::make_shared<AllocatedMemory>(
-      byte_size, preferred_memory_type, preferred_memory_type_id);
+  std::shared_ptr<MutableMemory> allocated_buffer;
+  if (preferred_memory_type == TRITONSERVER_MEMORY_CPU) {
+    allocated_buffer = std::make_shared<HostMemory>(byte_size);
+  } else {
+    allocated_buffer = std::make_shared<AllocatedMemory>(
+        byte_size, preferred_memory_type, preferred_memory_type_id);
+  }
 
   auto mutable_buffer = allocated_buffer->MutableBuffer(
       allocated_memory_type, allocated_memory_type_id);

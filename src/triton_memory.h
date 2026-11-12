@@ -180,6 +180,13 @@ class AllocatedMemory : public MutableMemory {
   ~AllocatedMemory() override;
 };
 
+class HostMemory : public MutableMemory {
+ public:
+  explicit HostMemory(size_t byte_size);
+
+  ~HostMemory() override;
+};
+
 class GrowableMemory : public MutableMemory {
  public:
   static Status Create(

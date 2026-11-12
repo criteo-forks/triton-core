@@ -26,6 +26,8 @@
 
 #include "triton_memory.h"
 
+#include <cstdlib>
+
 #include "pinned_memory_manager.h"
 #include "triton/common/logging.h"
 
@@ -262,6 +264,21 @@ AllocatedMemory::~AllocatedMemory()
     }
     buffer_ = nullptr;
   }
+}
+
+HostMemory::HostMemory(size_t byte_size)
+    : MutableMemory(nullptr, byte_size, TRITONSERVER_MEMORY_CPU, 0)
+{
+  if (total_byte_size_ != 0) {
+    buffer_ = static_cast<char*>(malloc(total_byte_size_));
+  }
+  total_byte_size_ = (buffer_ == nullptr) ? 0 : total_byte_size_;
+}
+
+HostMemory::~HostMemory()
+{
+  free(buffer_);
+  buffer_ = nullptr;
 }
 
 #ifdef TRITON_ENABLE_GPU
