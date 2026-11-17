@@ -252,18 +252,19 @@ RateLimiter::PayloadSlotAvailable(
               : 1;
       return payload_queue->queue_->SizeApprox() < (2 * multiplier);
     };
+    result = slot_available();
     if (!force_non_blocking && (wait_microseconds != 0)) {
-      std::stop_callback on_stop(stop_token, [payload_queue]() {
-        std::lock_guard<std::mutex> lk(payload_queue->mu_);
-        payload_queue->slot_cv_.notify_all();
-      });
-      std::unique_lock<std::mutex> lk(payload_queue->mu_);
-      result = payload_queue->slot_cv_.wait_for(
-          lk, std::chrono::microseconds(wait_microseconds),
-          [&]() { return slot_available() || stop_token.stop_requested(); });
+      if (!result) {
+        std::stop_callback on_stop(stop_token, [payload_queue]() {
+          std::lock_guard<std::mutex> lk(payload_queue->mu_);
+          payload_queue->slot_cv_.notify_all();
+        });
+        std::unique_lock<std::mutex> lk(payload_queue->mu_);
+        result = payload_queue->slot_cv_.wait_for(
+            lk, std::chrono::microseconds(wait_microseconds),
+            [&]() { return slot_available() || stop_token.stop_requested(); });
+      }
       result &= !stop_token.stop_requested();
-    } else {
-      result = slot_available();
     }
   } else {
     if (force_non_blocking) {
