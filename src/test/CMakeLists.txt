@@ -32,56 +32,29 @@ cmake_minimum_required(VERSION 3.31.8)
 find_package(GTest REQUIRED)
 
 #
-# CudaMemoryManger
+# Test-only view of the server.
 #
-set(
-  CUDA_MEMORY_MANAGER_SRCS
-  ../cuda_block_manager.cc
-  ../cuda_memory_manager.cc
-  ../cuda_utils.cc
-  ../status.cc
-)
-
-set(
-  CUDA_MEMORY_MANAGER_HDRS
-  ../cuda_block_manager.h
-  ../cuda_memory_manager.h
-  ../cuda_utils.h
-  ../status.h
-)
-
+# Built from the same objects as libtritonserver.so but without a version
+# script, so every internal C++ symbol is visible to the unit tests. It is
+# built only when a test asks for it and is never installed; the shipped
+# library keeps exporting the C API only.
 #
-# PinnedMemoryManger
-#
-set(
-  PINNED_MEMORY_MANAGER_SRCS
-  ../cuda_utils.cc
-  ../numa_utils.cc
-  ../pinned_memory_manager.cc
-  ../status.cc
+add_library(
+  triton-core-test SHARED EXCLUDE_FROM_ALL
+  $<TARGET_OBJECTS:triton-core-objects>
 )
-
-set(
-  PINNED_MEMORY_MANAGER_HDRS
-  ../cuda_utils.h
-  ../numa_utils.h
-  ../pinned_memory_manager.h
-  ../status.h
+set_target_properties(
+  triton-core-test
+  PROPERTIES
+    OUTPUT_NAME tritonserver_test
 )
-
-#
-# Memory
-#
-set(
-  MEMORY_SRCS
-  ../buffer_attributes.cc
-  ../triton_memory.cc
+target_link_directories(
+  triton-core-test
+  PRIVATE $<TARGET_PROPERTY:triton-core,LINK_DIRECTORIES>
 )
-
-set(
-  MEMORY_HDRS
-  ../buffer_attributes.h
-  ../triton_memory.h
+target_link_libraries(
+  triton-core-test
+  PUBLIC $<TARGET_PROPERTY:triton-core,LINK_LIBRARIES>
 )
 
 #
@@ -91,23 +64,6 @@ if(${TRITON_ENABLE_GPU})
   add_executable(
     response_cache_test
     response_cache_test.cc
-    ../cache_manager.cc
-    ../cache_manager.h
-    ../cache_entry.cc
-    ../cache_entry.h
-    ../filesystem/api.cc
-    ../filesystem/api.h
-    ../shared_library.cc
-    ../shared_library.h
-    ../status.cc
-    ../status.h
-    ../constants.h
-    ${MEMORY_SRCS}
-    ${CUDA_MEMORY_MANAGER_SRCS}
-    ${PINNED_MEMORY_MANAGER_SRCS}
-    ${MEMORY_HDRS}
-    ${CUDA_MEMORY_MANAGER_HDRS}
-    ${PINNED_MEMORY_MANAGER_HDRS}
   )
 
   set_target_properties(
@@ -146,7 +102,7 @@ if(${TRITON_ENABLE_GPU})
       triton-common-logging      # from repo-common
       triton-common-model-config # from repo-common
       proto-library              # from repo-common
-      triton-core
+      triton-core-test
       GTest::gtest
       GTest::gtest_main
       protobuf::libprotobuf
@@ -214,13 +170,6 @@ if(${TRITON_ENABLE_GPU})
   add_executable(
     memory_test
     memory_test.cc
-    ../constants.h
-    ${MEMORY_SRCS}
-    ${CUDA_MEMORY_MANAGER_SRCS}
-    ${PINNED_MEMORY_MANAGER_SRCS}
-    ${MEMORY_HDRS}
-    ${CUDA_MEMORY_MANAGER_HDRS}
-    ${PINNED_MEMORY_MANAGER_HDRS}
   )
 
   set_target_properties(
@@ -257,6 +206,7 @@ if(${TRITON_ENABLE_GPU})
       triton-common-error        # from repo-common
       triton-common-logging      # from repo-common
       proto-library              # from repo-common
+      triton-core-test
       GTest::gtest
       GTest::gtest_main
       protobuf::libprotobuf
@@ -284,8 +234,6 @@ if(${TRITON_ENABLE_GPU})
   add_executable(
     pinned_memory_manager_test
     pinned_memory_manager_test.cc
-    ${PINNED_MEMORY_MANAGER_SRCS}
-    ${PINNED_MEMORY_MANAGER_HDRS}
   )
 
   set_target_properties(
@@ -322,6 +270,7 @@ if(${TRITON_ENABLE_GPU})
       triton-common-error        # from repo-common
       triton-common-logging      # from repo-common
       proto-library              # from repo-common
+      triton-core-test
       GTest::gtest
       GTest::gtest_main
       protobuf::libprotobuf
@@ -386,15 +335,6 @@ install(
 add_executable(
   repo_agent_test
   repo_agent_test.cc
-  ../repo_agent.cc
-  ../status.cc
-  ../filesystem/api.cc
-  ../model_config_utils.cc
-  ../repo_agent.h
-  ../shared_library.h
-  ../status.h
-  ../filesystem/api.h
-  ../model_config_utils.h
 )
 
 set_target_properties(
@@ -423,6 +363,7 @@ target_link_libraries(
     triton-common-json         # from repo-common
     triton-common-logging      # from repo-common
     proto-library              # from repo-common
+    triton-core-test
     GTest::gtest
     GTest::gtest_main
     protobuf::libprotobuf
@@ -441,14 +382,6 @@ if(${TRITON_ENABLE_METRICS})
   add_executable(
     metrics_api_test
     metrics_api_test.cc
-    ${PINNED_MEMORY_MANAGER_SRCS}
-    ${PINNED_MEMORY_MANAGER_HDRS}
-    ../metric_family.cc
-    ../metric_family.h
-    ../metrics.cc
-    ../metrics.h
-    ../infer_parameter.cc
-    ../infer_parameter.h
   )
 
   set_target_properties(
@@ -481,7 +414,7 @@ if(${TRITON_ENABLE_METRICS})
       triton-common-error   # from repo-common
       triton-common-logging # from repo-common
       proto-library         # from repo-common
-      triton-core
+      triton-core-test
       GTest::gtest
       GTest::gtest_main
       GTest::gmock
@@ -739,9 +672,6 @@ if(${TRITON_ENABLE_GPU})
   add_executable(
     input_byte_size_test
     input_byte_size_test.cc
-    ../constants.h
-    ${CUDA_MEMORY_MANAGER_SRCS}
-    ${CUDA_MEMORY_MANAGER_HDRS}
   )
   target_include_directories(
     input_byte_size_test
@@ -767,7 +697,7 @@ if(${TRITON_ENABLE_GPU})
     PRIVATE
       dl
       triton-common-error        # from repo-common
-      triton-core
+      triton-core-test
       triton-common-logging      # from repo-common
       proto-library              # from repo-common
       GTest::gtest
@@ -793,7 +723,7 @@ else()
     input_byte_size_test
     PRIVATE
       triton-common-error # from repo-common
-      triton-core
+      triton-core-test
       GTest::gtest
       GTest::gtest_main
       GTest::gmock
@@ -816,8 +746,8 @@ install(
 
 # Internal C++ symbols are hidden by triton-core's export script. Compile the
 # same sources and reuse its build settings for the scheduler regression test.
-get_target_property(scheduler_test_sources triton-core SOURCES)
-get_target_property(scheduler_test_source_dir triton-core SOURCE_DIR)
+get_target_property(scheduler_test_sources triton-core-objects SOURCES)
+get_target_property(scheduler_test_source_dir triton-core-objects SOURCE_DIR)
 list(TRANSFORM scheduler_test_sources PREPEND "${scheduler_test_source_dir}/")
 add_executable(scheduler_regression_test EXCLUDE_FROM_ALL
   scheduler_regression_test.cc ${scheduler_test_sources})
